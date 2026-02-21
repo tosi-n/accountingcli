@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  py-compile:
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNTINGCLI_INTERNAL_API_KEY: test-internal-key
+      ACCOUNTINGCLI_TOKEN_ENCRYPTION_KEY: test-token-key
+      PYTHONPATH: service:vendor
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r service/requirements.txt pytest
+
+      - name: Compile
+        run: |
+          python -m compileall -q service/app
+          python -m compileall -q vendor/choreo
+
+      - name: Run tests
+        run: |
+          pytest -q service/tests
