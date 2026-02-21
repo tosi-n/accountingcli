@@ -6,8 +6,8 @@ ENV PYTHONPATH=/app/vendor
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-    curl \\
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
   && rm -rf /var/lib/apt/lists/*
 
 COPY service/requirements.txt /app/requirements.txt
@@ -17,4 +17,3 @@ COPY vendor /app/vendor
 COPY service/app /app/app
 
 CMD ["python", "-m", "app.worker"]
-
