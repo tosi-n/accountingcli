@@ -6,8 +6,7 @@ Scope (v1):
 - OAuth broker for: Xero, QuickBooks, Sage, FreeAgent
 - Sync surface for normalized bank transactions (worker via Choreo)
 
-This repo **copies** upstream behavior from `jack-2` into `vendor/jack2/...` as the
-source-of-truth reference. We do not move or delete anything from `jack-2`.
+This service is self-contained and focused on internal accounting integration workflows.
 
 ## Run (local)
 

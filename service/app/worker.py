@@ -199,7 +199,7 @@ async def sync_xero(ctx, step):
             if len(page_items) < page_size:
                 break
 
-        # Mirror jack-2 behavior: invoices are "bills" in this system.
+        # Keep invoice semantics aligned: bills are represented as invoices.
         # Xero exposes bills as Invoices with Type=ACCPAY.
         bill_types = {"ACCPAY", "ACCPAYCREDIT"}
         invoices = [i for i in invoices if (i.get("Type") or "") in bill_types]

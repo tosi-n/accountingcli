@@ -2,4 +2,3 @@
 .github
 __pycache__/
 *.pyc
-vendor/jack2/
