@@ -30,5 +30,7 @@ docker run --rm --env-file .env accountingcli-worker:dev
 - `POST /internal/sync/{provider}`
 - `GET /internal/data/bank-transactions?business_profile_id=...&provider=...&since=...`
 - `GET /internal/data/invoices?business_profile_id=...&provider=...&since=...`
+- `GET /internal/data/account-codes?business_profile_id=...&provider=...`
+- `GET /internal/data/tax-codes?business_profile_id=...&provider=...`
 
 All internal endpoints require `X-Internal-API-Key: $ACCOUNTINGCLI_INTERNAL_API_KEY`.

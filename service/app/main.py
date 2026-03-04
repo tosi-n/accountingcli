@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import os
+import time
 import urllib.parse
 from typing import Any
 from uuid import UUID
@@ -19,14 +20,21 @@ from app.internal_auth import require_internal_api_key
 from app.providers import (
     build_authorize_url,
     exchange_code,
+    free_agent_get_categories,
     free_agent_get_clients,
+    quickbooks_get_accounts,
+    quickbooks_get_tax_codes,
+    quickbooks_get_tax_rates,
     refresh_token as provider_refresh_token,
+    xero_get_accounts,
     xero_get_connections,
+    xero_get_tax_rates,
 )
 from app.settings import settings
 
 
 app = FastAPI(title="accountingcli", version="0.1.0")
+SUPPORTED_PROVIDERS = {"xero", "quickbooks", "sage", "free_agent"}
 
 
 @app.on_event("startup")
@@ -69,6 +77,276 @@ class OAuthStatusOut(BaseModel):
 
 def _cipher() -> TokenCipher:
     return TokenCipher(settings.ACCOUNTINGCLI_TOKEN_ENCRYPTION_KEY)
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _token_expires_at(token: dict[str, Any]) -> int:
+    value = token.get("expires_at")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
+
+
+async def _maybe_refresh_connection_token(db: AsyncSession, conn: AccountingConnection) -> dict[str, Any]:
+    token = _cipher().decrypt_json(conn.token_encrypted)
+    if _token_expires_at(token) > int(time.time()) + 60:
+        return token
+    refresh_token = token.get("refresh_token")
+    if not refresh_token:
+        return token
+    refreshed = await provider_refresh_token(conn.provider, str(refresh_token))
+    conn.token_encrypted = _cipher().encrypt_json(refreshed)
+    conn.updated_at = dt.datetime.now(dt.UTC)
+    await db.commit()
+    await db.refresh(conn)
+    return refreshed
+
+
+async def _persist_connection_metadata(
+    db: AsyncSession,
+    conn: AccountingConnection,
+    *,
+    tenant_id: str | None = None,
+    tenant_name: str | None = None,
+    metadata_patch: dict[str, Any] | None = None,
+) -> None:
+    changed = False
+    if tenant_id is not None and tenant_id != conn.tenant_id:
+        conn.tenant_id = tenant_id
+        changed = True
+    if tenant_name is not None and tenant_name != conn.tenant_name:
+        conn.tenant_name = tenant_name
+        changed = True
+    if metadata_patch:
+        merged = dict(conn.metadata_ or {})
+        merged.update(metadata_patch)
+        if merged != dict(conn.metadata_ or {}):
+            conn.metadata_ = merged
+            changed = True
+    if changed:
+        conn.updated_at = dt.datetime.now(dt.UTC)
+        await db.commit()
+        await db.refresh(conn)
+
+
+async def _resolve_xero_tenant_id(
+    db: AsyncSession,
+    conn: AccountingConnection,
+    token: dict[str, Any],
+) -> str | None:
+    if conn.tenant_id:
+        return conn.tenant_id
+    try:
+        connections = await xero_get_connections(token)
+    except Exception:
+        return None
+    if not connections:
+        return None
+    tenant_id = str(connections[0].get("tenantId") or "")
+    tenant_name = str(connections[0].get("tenantName") or "") or None
+    if not tenant_id:
+        return None
+    await _persist_connection_metadata(db, conn, tenant_id=tenant_id, tenant_name=tenant_name)
+    return tenant_id
+
+
+def _resolve_quickbooks_realm_id(conn: AccountingConnection, token: dict[str, Any]) -> str | None:
+    metadata = dict(conn.metadata_ or {})
+    realm_id = conn.tenant_id or metadata.get("realm_id") or token.get("realm_id")
+    return str(realm_id) if realm_id else None
+
+
+async def _resolve_free_agent_subdomain(
+    db: AsyncSession,
+    conn: AccountingConnection,
+    token: dict[str, Any],
+) -> str | None:
+    subdomain = conn.tenant_id or token.get("business_id") or token.get("businessId")
+    tenant_name = conn.tenant_name or token.get("business_name") or token.get("businessName")
+    metadata_patch: dict[str, Any] = {}
+
+    if not subdomain:
+        try:
+            clients = await free_agent_get_clients(token)
+            items = clients.get("clients") or []
+            if items:
+                subdomain = items[0].get("subdomain")
+                tenant_name = items[0].get("name")
+                metadata_patch["available_clients"] = items[:20]
+        except Exception:
+            subdomain = None
+
+    if subdomain:
+        await _persist_connection_metadata(
+            db,
+            conn,
+            tenant_id=str(subdomain),
+            tenant_name=str(tenant_name) if tenant_name else None,
+            metadata_patch=metadata_patch or None,
+        )
+    return str(subdomain) if subdomain else None
+
+
+def _normalize_xero_account_codes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "code": row.get("Code") or None,
+                "name": row.get("Name") or None,
+                "platform_record_id": row.get("AccountID") or None,
+                "type": row.get("Type") or None,
+                "status": row.get("Status") or None,
+                "raw": row,
+            }
+        )
+    return out
+
+
+def _normalize_xero_tax_codes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "code": row.get("TaxType") or None,
+                "name": row.get("Name") or None,
+                "rate": _to_float(row.get("DisplayTaxRate") or row.get("EffectiveRate")),
+                "platform_record_id": row.get("TaxTypeID") or None,
+                "status": row.get("Status") or None,
+                "raw": row,
+            }
+        )
+    return out
+
+
+def _normalize_quickbooks_account_codes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "code": row.get("AcctNum") or row.get("Id") or None,
+                "name": row.get("Name") or row.get("FullyQualifiedName") or None,
+                "platform_record_id": row.get("Id") or None,
+                "type": row.get("AccountType") or row.get("Classification") or None,
+                "status": "ACTIVE" if row.get("Active", True) else "INACTIVE",
+                "raw": row,
+            }
+        )
+    return out
+
+
+def _quickbooks_tax_rate_index(rows: list[dict[str, Any]]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rate_id = row.get("Id")
+        rate_value = _to_float(row.get("RateValue"))
+        if rate_id and rate_value is not None:
+            out[str(rate_id)] = rate_value
+    return out
+
+
+def _normalize_quickbooks_tax_codes(
+    rows: list[dict[str, Any]],
+    *,
+    tax_rate_by_id: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    tax_rate_by_id = tax_rate_by_id or {}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rate: float | None = None
+        detail_groups = [
+            (row.get("SalesTaxRateList") or {}).get("TaxRateDetail"),
+            (row.get("PurchaseTaxRateList") or {}).get("TaxRateDetail"),
+        ]
+        for details in detail_groups:
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                ref = detail.get("TaxRateRef") or {}
+                ref_id = str(ref.get("value") or "")
+                if ref_id and ref_id in tax_rate_by_id:
+                    rate = tax_rate_by_id[ref_id]
+                    break
+            if rate is not None:
+                break
+
+        out.append(
+            {
+                "code": row.get("Name") or row.get("Id") or None,
+                "name": row.get("Name") or None,
+                "rate": rate,
+                "platform_record_id": row.get("Id") or None,
+                "status": "ACTIVE" if row.get("Active", True) else "INACTIVE",
+                "raw": row,
+            }
+        )
+    return out
+
+
+def _normalize_free_agent_account_codes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "code": row.get("nominal_code") or row.get("code") or row.get("url") or None,
+                "name": row.get("description") or row.get("category") or row.get("name") or None,
+                "platform_record_id": row.get("url") or row.get("id") or None,
+                "type": row.get("category") or None,
+                "status": "ACTIVE",
+                "raw": row,
+            }
+        )
+    return out
+
+
+def _normalize_free_agent_tax_codes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_rate = row.get("auto_sales_tax_rate")
+        rate = _to_float(raw_rate)
+        code = str(raw_rate) if raw_rate is not None else None
+        key = f"{code}|{rate}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "code": code,
+                "name": f"{code}%" if code else None,
+                "rate": rate,
+                "platform_record_id": None,
+                "status": "ACTIVE",
+                "raw": {"auto_sales_tax_rate": raw_rate},
+            }
+        )
+    return out
 
 
 async def _create_oauth_state(
@@ -182,7 +460,7 @@ async def _get_connection(db: AsyncSession, business_profile_id: UUID, provider:
 
 @app.post("/internal/oauth/{provider}/authorize-url", dependencies=[Depends(require_internal_api_key)])
 async def authorize_url(provider: str, body: AuthorizeUrlIn) -> dict[str, str]:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
         state = await _create_oauth_state(
@@ -199,7 +477,7 @@ async def authorize_url(provider: str, body: AuthorizeUrlIn) -> dict[str, str]:
 
 @app.post("/internal/oauth/{provider}/exchange", dependencies=[Depends(require_internal_api_key)])
 async def exchange(provider: str, body: ExchangeIn) -> dict[str, Any]:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     bits = _parse_callback_url(body.callback_url)
     async for db in session_scope():
@@ -268,7 +546,7 @@ async def exchange(provider: str, body: ExchangeIn) -> dict[str, Any]:
     response_model=OAuthStatusOut,
 )
 async def status(provider: str, business_profile_id: UUID) -> OAuthStatusOut:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
         conn = await _get_connection(db, business_profile_id, provider)
@@ -279,7 +557,7 @@ async def status(provider: str, business_profile_id: UUID) -> OAuthStatusOut:
 
 @app.post("/internal/oauth/{provider}/disconnect", dependencies=[Depends(require_internal_api_key)])
 async def disconnect(provider: str, body: DisconnectIn) -> dict[str, Any]:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
         await db.execute(
@@ -294,7 +572,7 @@ async def disconnect(provider: str, body: DisconnectIn) -> dict[str, Any]:
 
 @app.post("/internal/sync/{provider}", dependencies=[Depends(require_internal_api_key)])
 async def trigger_sync(provider: str, body: SyncIn) -> dict[str, Any]:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     if provider == "sage":
         raise HTTPException(status_code=400, detail="Sage sync is unsupported in this release")
@@ -347,7 +625,7 @@ async def list_bank_transactions(
     provider: str,
     since: str | None = None,
 ) -> list[dict[str, Any]]:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
         q = select(BankTransaction).where(
@@ -381,7 +659,7 @@ async def list_invoices(
     provider: str,
     since: str | None = None,
 ) -> list[dict[str, Any]]:
-    if provider not in {"xero", "quickbooks", "sage", "free_agent"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
         q = select(Invoice).where(
@@ -411,3 +689,145 @@ async def list_invoices(
             }
             for r in rows
         ]
+
+
+@app.get("/internal/data/account-codes", dependencies=[Depends(require_internal_api_key)])
+async def list_account_codes(
+    business_profile_id: UUID,
+    provider: str,
+) -> list[dict[str, Any]]:
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    if provider == "sage":
+        return []
+
+    async for db in session_scope():
+        conn = await _get_connection(db, business_profile_id, provider)
+        if not conn:
+            return []
+
+        try:
+            token = await _maybe_refresh_connection_token(db, conn)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to refresh {provider} token: {exc}") from exc
+
+        if provider == "xero":
+            tenant_id = await _resolve_xero_tenant_id(db, conn, token)
+            if not tenant_id:
+                return []
+            payload = await xero_get_accounts(token, tenant_id)
+            rows = payload.get("Accounts") or []
+            return _normalize_xero_account_codes(rows)
+
+        if provider == "quickbooks":
+            realm_id = _resolve_quickbooks_realm_id(conn, token)
+            if not realm_id:
+                return []
+            rows: list[dict[str, Any]] = []
+            page_size = 200
+            max_pages = 20
+            for page in range(1, max_pages + 1):
+                start_position = ((page - 1) * page_size) + 1
+                payload = await quickbooks_get_accounts(
+                    token,
+                    realm_id,
+                    start_position=start_position,
+                    max_results=page_size,
+                )
+                page_rows = (payload.get("QueryResponse") or {}).get("Account") or []
+                if not page_rows:
+                    break
+                rows.extend([r for r in page_rows if isinstance(r, dict)])
+                if len(page_rows) < page_size:
+                    break
+            return _normalize_quickbooks_account_codes(rows)
+
+        if provider == "free_agent":
+            subdomain = await _resolve_free_agent_subdomain(db, conn, token)
+            if not subdomain:
+                return []
+            payload = await free_agent_get_categories(token, subdomain)
+            rows = payload.get("categories") or []
+            return _normalize_free_agent_account_codes(rows)
+
+        return []
+
+
+@app.get("/internal/data/tax-codes", dependencies=[Depends(require_internal_api_key)])
+async def list_tax_codes(
+    business_profile_id: UUID,
+    provider: str,
+) -> list[dict[str, Any]]:
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    if provider == "sage":
+        return []
+
+    async for db in session_scope():
+        conn = await _get_connection(db, business_profile_id, provider)
+        if not conn:
+            return []
+
+        try:
+            token = await _maybe_refresh_connection_token(db, conn)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to refresh {provider} token: {exc}") from exc
+
+        if provider == "xero":
+            tenant_id = await _resolve_xero_tenant_id(db, conn, token)
+            if not tenant_id:
+                return []
+            payload = await xero_get_tax_rates(token, tenant_id)
+            rows = payload.get("TaxRates") or []
+            return _normalize_xero_tax_codes(rows)
+
+        if provider == "quickbooks":
+            realm_id = _resolve_quickbooks_realm_id(conn, token)
+            if not realm_id:
+                return []
+            rows: list[dict[str, Any]] = []
+            tax_rate_rows: list[dict[str, Any]] = []
+            page_size = 200
+            max_pages = 20
+            for page in range(1, max_pages + 1):
+                start_position = ((page - 1) * page_size) + 1
+                payload = await quickbooks_get_tax_codes(
+                    token,
+                    realm_id,
+                    start_position=start_position,
+                    max_results=page_size,
+                )
+                page_rows = (payload.get("QueryResponse") or {}).get("TaxCode") or []
+                if not page_rows:
+                    break
+                rows.extend([r for r in page_rows if isinstance(r, dict)])
+                if len(page_rows) < page_size:
+                    break
+            for page in range(1, max_pages + 1):
+                start_position = ((page - 1) * page_size) + 1
+                payload = await quickbooks_get_tax_rates(
+                    token,
+                    realm_id,
+                    start_position=start_position,
+                    max_results=page_size,
+                )
+                page_rows = (payload.get("QueryResponse") or {}).get("TaxRate") or []
+                if not page_rows:
+                    break
+                tax_rate_rows.extend([r for r in page_rows if isinstance(r, dict)])
+                if len(page_rows) < page_size:
+                    break
+            return _normalize_quickbooks_tax_codes(
+                rows,
+                tax_rate_by_id=_quickbooks_tax_rate_index(tax_rate_rows),
+            )
+
+        if provider == "free_agent":
+            subdomain = await _resolve_free_agent_subdomain(db, conn, token)
+            if not subdomain:
+                return []
+            payload = await free_agent_get_categories(token, subdomain)
+            rows = payload.get("categories") or []
+            return _normalize_free_agent_tax_codes(rows)
+
+        return []

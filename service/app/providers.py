@@ -238,6 +238,36 @@ async def xero_get_invoices(
         return resp.json()
 
 
+async def xero_get_accounts(token: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "xero-tenant-id": tenant_id,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(
+            urllib.parse.urljoin(settings.XERO_BASE_URL, "/api.xro/2.0/Accounts"),
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def xero_get_tax_rates(token: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "xero-tenant-id": tenant_id,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(
+            urllib.parse.urljoin(settings.XERO_BASE_URL, "/api.xro/2.0/TaxRates"),
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def free_agent_api_get(
     path: str,
     token: dict[str, Any],
@@ -289,6 +319,13 @@ async def free_agent_get_bank_transactions(
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"page": page, "per_page": per_page}
     return await free_agent_api_get("/v2/bank_transactions", token, subdomain=subdomain, params=params)
+
+
+async def free_agent_get_categories(
+    token: dict[str, Any],
+    subdomain: str,
+) -> dict[str, Any]:
+    return await free_agent_api_get("/v2/categories", token, subdomain=subdomain)
 
 
 def _quickbooks_base_url() -> str:
@@ -354,4 +391,37 @@ async def quickbooks_get_bills(
     max_results: int = 200,
 ) -> dict[str, Any]:
     q = f"select * from Bill startposition {int(start_position)} maxresults {int(max_results)}"  # nosec
+    return await quickbooks_query(token, realm_id, q)
+
+
+async def quickbooks_get_accounts(
+    token: dict[str, Any],
+    realm_id: str,
+    *,
+    start_position: int = 1,
+    max_results: int = 200,
+) -> dict[str, Any]:
+    q = f"select * from Account startposition {int(start_position)} maxresults {int(max_results)}"  # nosec
+    return await quickbooks_query(token, realm_id, q)
+
+
+async def quickbooks_get_tax_codes(
+    token: dict[str, Any],
+    realm_id: str,
+    *,
+    start_position: int = 1,
+    max_results: int = 200,
+) -> dict[str, Any]:
+    q = f"select * from TaxCode startposition {int(start_position)} maxresults {int(max_results)}"  # nosec
+    return await quickbooks_query(token, realm_id, q)
+
+
+async def quickbooks_get_tax_rates(
+    token: dict[str, Any],
+    realm_id: str,
+    *,
+    start_position: int = 1,
+    max_results: int = 200,
+) -> dict[str, Any]:
+    q = f"select * from TaxRate startposition {int(start_position)} maxresults {int(max_results)}"  # nosec
     return await quickbooks_query(token, realm_id, q)
