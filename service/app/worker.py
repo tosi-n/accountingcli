@@ -56,12 +56,17 @@ async def _maybe_refresh(provider: str, token: dict[str, Any]) -> dict[str, Any]
     return await provider_refresh_token(provider, str(rt))
 
 
-async def _load_connection(business_profile_id: str, provider: str) -> AccountingConnection | None:
+async def _load_connection(
+    business_profile_id: str,
+    provider: str,
+    user_id: str,
+) -> AccountingConnection | None:
     async for db in session_scope():
         res = await db.execute(
             select(AccountingConnection).where(
                 AccountingConnection.business_profile_id == business_profile_id,
                 AccountingConnection.provider == provider,
+                AccountingConnection.user_id == user_id,
             )
         )
         return res.scalars().first()
@@ -93,6 +98,7 @@ async def _persist_connection_updates(
     *,
     business_profile_id: str,
     provider: str,
+    user_id: str,
     token: dict[str, Any] | None = None,
     tenant_id: str | None = None,
     tenant_name: str | None = None,
@@ -112,6 +118,7 @@ async def _persist_connection_updates(
             .where(
                 AccountingConnection.business_profile_id == business_profile_id,
                 AccountingConnection.provider == provider,
+                AccountingConnection.user_id == user_id,
             )
             .values(**patch)
         )
@@ -123,16 +130,27 @@ async def sync_xero(ctx, step):
     bp_id = str(ctx.data.get("business_profile_id") or "")
     if not bp_id:
         return {"outcome": "skipped", "reason": "missing_business_profile_id"}
+    user_id = str(ctx.data.get("user_id") or "")
+    if not user_id:
+        return {"outcome": "skipped", "reason": "missing_user_id"}
 
     sync_types = _normalize_sync_types(ctx.data.get("sync_types"))
 
-    conn = await step.run("load-connection", lambda: _load_connection(bp_id, "xero"))
+    conn = await step.run("load-connection", lambda: _load_connection(bp_id, "xero", user_id))
     if not conn:
         return {"outcome": "skipped", "reason": "no_connection"}
 
     token = _cipher().decrypt_json(conn.token_encrypted)
     token = await step.run("refresh-token", lambda: _maybe_refresh("xero", token))
-    await step.run("persist-token", lambda: _persist_connection_updates(business_profile_id=bp_id, provider="xero", token=token))
+    await step.run(
+        "persist-token",
+        lambda: _persist_connection_updates(
+            business_profile_id=bp_id,
+            provider="xero",
+            user_id=user_id,
+            token=token,
+        ),
+    )
 
     tenant_id = conn.tenant_id
     tenant_name = conn.tenant_name
@@ -146,6 +164,7 @@ async def sync_xero(ctx, step):
                 lambda: _persist_connection_updates(
                     business_profile_id=bp_id,
                     provider="xero",
+                    user_id=user_id,
                     tenant_id=str(tenant_id) if tenant_id else None,
                     tenant_name=str(tenant_name) if tenant_name else None,
                 ),
@@ -253,10 +272,13 @@ async def sync_quickbooks(ctx, step):
     bp_id = str(ctx.data.get("business_profile_id") or "")
     if not bp_id:
         return {"outcome": "skipped", "reason": "missing_business_profile_id"}
+    user_id = str(ctx.data.get("user_id") or "")
+    if not user_id:
+        return {"outcome": "skipped", "reason": "missing_user_id"}
 
     sync_types = _normalize_sync_types(ctx.data.get("sync_types"))
 
-    conn = await step.run("load-connection", lambda: _load_connection(bp_id, "quickbooks"))
+    conn = await step.run("load-connection", lambda: _load_connection(bp_id, "quickbooks", user_id))
     if not conn:
         return {"outcome": "skipped", "reason": "no_connection"}
 
@@ -264,7 +286,12 @@ async def sync_quickbooks(ctx, step):
     token = await step.run("refresh-token", lambda: _maybe_refresh("quickbooks", token))
     await step.run(
         "persist-token",
-        lambda: _persist_connection_updates(business_profile_id=bp_id, provider="quickbooks", token=token),
+        lambda: _persist_connection_updates(
+            business_profile_id=bp_id,
+            provider="quickbooks",
+            user_id=user_id,
+            token=token,
+        ),
     )
 
     metadata = dict(conn.metadata_ or {})
@@ -289,6 +316,7 @@ async def sync_quickbooks(ctx, step):
             lambda: _persist_connection_updates(
                 business_profile_id=bp_id,
                 provider="quickbooks",
+                user_id=user_id,
                 tenant_id=str(realm_id),
                 tenant_name=str(tenant_name) if tenant_name else None,
             ),
@@ -440,10 +468,13 @@ async def sync_free_agent(ctx, step):
     bp_id = str(ctx.data.get("business_profile_id") or "")
     if not bp_id:
         return {"outcome": "skipped", "reason": "missing_business_profile_id"}
+    user_id = str(ctx.data.get("user_id") or "")
+    if not user_id:
+        return {"outcome": "skipped", "reason": "missing_user_id"}
 
     sync_types = _normalize_sync_types(ctx.data.get("sync_types"))
 
-    conn = await step.run("load-connection", lambda: _load_connection(bp_id, "free_agent"))
+    conn = await step.run("load-connection", lambda: _load_connection(bp_id, "free_agent", user_id))
     if not conn:
         return {"outcome": "skipped", "reason": "no_connection"}
 
@@ -451,7 +482,12 @@ async def sync_free_agent(ctx, step):
     token = await step.run("refresh-token", lambda: _maybe_refresh("free_agent", token))
     await step.run(
         "persist-token",
-        lambda: _persist_connection_updates(business_profile_id=bp_id, provider="free_agent", token=token),
+        lambda: _persist_connection_updates(
+            business_profile_id=bp_id,
+            provider="free_agent",
+            user_id=user_id,
+            token=token,
+        ),
     )
 
     # FreeAgent requires X-Subdomain for most endpoints (multi-tenant by client subdomain).
@@ -469,6 +505,7 @@ async def sync_free_agent(ctx, step):
             lambda: _persist_connection_updates(
                 business_profile_id=bp_id,
                 provider="free_agent",
+                user_id=user_id,
                 tenant_id=str(subdomain),
                 tenant_name=str(tenant_name) if tenant_name else None,
             ),

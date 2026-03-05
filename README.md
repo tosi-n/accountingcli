@@ -28,6 +28,7 @@ docker run --rm --env-file .env accountingcli-worker:dev
 - `GET /internal/oauth/{provider}/status?business_profile_id=...`
 - `POST /internal/oauth/{provider}/disconnect`
 - `POST /internal/sync/{provider}`
+- `POST /internal/publish/{provider}`
 - `GET /internal/data/bank-transactions?business_profile_id=...&provider=...&since=...`
 - `GET /internal/data/invoices?business_profile_id=...&provider=...&since=...`
 - `GET /internal/data/account-codes?business_profile_id=...&provider=...`

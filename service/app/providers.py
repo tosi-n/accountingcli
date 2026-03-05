@@ -425,3 +425,85 @@ async def quickbooks_get_tax_rates(
 ) -> dict[str, Any]:
     q = f"select * from TaxRate startposition {int(start_position)} maxresults {int(max_results)}"  # nosec
     return await quickbooks_query(token, realm_id, q)
+
+
+async def xero_create_invoices(
+    token: dict[str, Any],
+    tenant_id: str,
+    invoices: list[dict[str, Any]],
+) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "xero-tenant-id": tenant_id,
+    }
+    payload = {"Invoices": invoices}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.put(
+            urllib.parse.urljoin(settings.XERO_BASE_URL, "/api.xro/2.0/Invoices"),
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def quickbooks_get_vendors(
+    token: dict[str, Any],
+    realm_id: str,
+    *,
+    start_position: int = 1,
+    max_results: int = 200,
+) -> dict[str, Any]:
+    q = f"select * from Vendor startposition {int(start_position)} maxresults {int(max_results)}"  # nosec
+    return await quickbooks_query(token, realm_id, q)
+
+
+async def quickbooks_create_bill(
+    token: dict[str, Any],
+    realm_id: str,
+    bill: dict[str, Any],
+    *,
+    minorversion: int = 70,
+) -> dict[str, Any]:
+    url = urllib.parse.urljoin(_quickbooks_base_url(), f"/v3/company/{realm_id}/bill")
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    params = {"minorversion": minorversion}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, headers=headers, params=params, json=bill)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def free_agent_api_post(
+    path: str,
+    token: dict[str, Any],
+    *,
+    subdomain: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = urllib.parse.urljoin(settings.FREE_AGENT_BASE_URL, path)
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if subdomain:
+        headers["X-Subdomain"] = subdomain
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, headers=headers, json=payload or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def free_agent_create_bill(
+    token: dict[str, Any],
+    subdomain: str,
+    bill: dict[str, Any],
+) -> dict[str, Any]:
+    return await free_agent_api_post("/v2/bills", token, subdomain=subdomain, payload={"bill": bill})

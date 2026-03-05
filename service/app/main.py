@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import os
+import re
 import time
 import urllib.parse
 from typing import Any
@@ -20,12 +21,16 @@ from app.internal_auth import require_internal_api_key
 from app.providers import (
     build_authorize_url,
     exchange_code,
+    free_agent_create_bill,
     free_agent_get_categories,
     free_agent_get_clients,
+    quickbooks_create_bill,
     quickbooks_get_accounts,
+    quickbooks_get_vendors,
     quickbooks_get_tax_codes,
     quickbooks_get_tax_rates,
     refresh_token as provider_refresh_token,
+    xero_create_invoices,
     xero_get_accounts,
     xero_get_connections,
     xero_get_tax_rates,
@@ -67,6 +72,13 @@ class SyncIn(BaseModel):
     business_profile_id: UUID
     user_id: UUID
     sync_types: list[str] = ["bank-transactions"]
+
+
+class PublishIn(BaseModel):
+    business_profile_id: UUID
+    user_id: UUID
+    payload: dict[str, Any]
+    idempotency_key: str | None = None
 
 
 class OAuthStatusOut(BaseModel):
@@ -349,6 +361,492 @@ def _normalize_free_agent_tax_codes(rows: list[dict[str, Any]]) -> list[dict[str
     return out
 
 
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_date(value: Any) -> str | None:
+    text = _as_text(value)
+    if not text:
+        return None
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    if " " in text:
+        text = text.split(" ", 1)[0]
+    return text or None
+
+
+def _normalize_token(value: Any) -> str:
+    text = _as_text(value).lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _coalesce_text(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = _as_text(payload.get(key))
+        if value:
+            return value
+    return None
+
+
+def _coalesce_float(payload: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = _to_float(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_publish_line_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_items = payload.get("line_items")
+    out: list[dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        for row in raw_items:
+            if not isinstance(row, dict):
+                continue
+            amount = _coalesce_float(row, "amount", "line_amount", "line_total", "total")
+            quantity = _coalesce_float(row, "quantity", "qty")
+            unit_amount = _coalesce_float(row, "unit_amount", "unit_price", "price")
+            description = _coalesce_text(row, "description", "name")
+            if amount is None and quantity is not None and unit_amount is not None:
+                amount = quantity * unit_amount
+            out.append(
+                {
+                    "description": description,
+                    "amount": amount,
+                    "quantity": quantity,
+                    "unit_amount": unit_amount,
+                    "account_code": _coalesce_text(row, "account_code", "account_category"),
+                    "tax_code": _coalesce_text(row, "tax_code", "tax_type"),
+                    "tax": _coalesce_float(row, "tax"),
+                }
+            )
+    if out:
+        return out
+
+    amount = _coalesce_float(payload, "amount", "total")
+    return [
+        {
+            "description": _coalesce_text(payload, "description", "summary", "vendor"),
+            "amount": amount,
+            "quantity": 1.0 if amount is not None else None,
+            "unit_amount": amount,
+            "account_code": _coalesce_text(payload, "account_code"),
+            "tax_code": _coalesce_text(payload, "tax_code"),
+            "tax": _coalesce_float(payload, "tax"),
+        }
+    ]
+
+
+async def _resolve_quickbooks_account_ref(
+    token: dict[str, Any],
+    realm_id: str,
+    payload: dict[str, Any],
+) -> str | None:
+    direct = _coalesce_text(payload, "account_platform_record_id", "account_id")
+    if direct:
+        return direct
+
+    candidates = [
+        _coalesce_text(payload, "account_code"),
+        _coalesce_text(payload, "account_name"),
+        _coalesce_text(payload, "category"),
+    ]
+    candidate_tokens = {_normalize_token(v) for v in candidates if v}
+    if not candidate_tokens:
+        return None
+
+    page_size = 200
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+        start_position = ((page - 1) * page_size) + 1
+        response = await quickbooks_get_accounts(
+            token,
+            realm_id,
+            start_position=start_position,
+            max_results=page_size,
+        )
+        rows = (response.get("QueryResponse") or {}).get("Account") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            probe_tokens = {
+                _normalize_token(row.get("Id")),
+                _normalize_token(row.get("AcctNum")),
+                _normalize_token(row.get("Name")),
+                _normalize_token(row.get("FullyQualifiedName")),
+            }
+            if candidate_tokens.intersection({t for t in probe_tokens if t}):
+                resolved = _as_text(row.get("Id"))
+                if resolved:
+                    return resolved
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _resolve_quickbooks_tax_code_ref(
+    token: dict[str, Any],
+    realm_id: str,
+    payload: dict[str, Any],
+) -> str | None:
+    direct = _coalesce_text(payload, "tax_platform_record_id", "tax_code_id")
+    if direct:
+        return direct
+
+    candidate = _coalesce_text(payload, "tax_code")
+    if not candidate:
+        return None
+    candidate_token = _normalize_token(candidate)
+    if not candidate_token:
+        return None
+
+    page_size = 200
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+        start_position = ((page - 1) * page_size) + 1
+        response = await quickbooks_get_tax_codes(
+            token,
+            realm_id,
+            start_position=start_position,
+            max_results=page_size,
+        )
+        rows = (response.get("QueryResponse") or {}).get("TaxCode") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            probe_tokens = {
+                _normalize_token(row.get("Id")),
+                _normalize_token(row.get("Name")),
+                _normalize_token(row.get("Code")),
+            }
+            if candidate_token in {t for t in probe_tokens if t}:
+                resolved = _as_text(row.get("Id"))
+                if resolved:
+                    return resolved
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _resolve_quickbooks_vendor_ref(
+    token: dict[str, Any],
+    realm_id: str,
+    payload: dict[str, Any],
+) -> str | None:
+    direct = _coalesce_text(payload, "contact_id", "vendor_id", "vendor_platform_record_id")
+    if direct:
+        return direct
+
+    vendor_name = _coalesce_text(payload, "vendor", "contact_name")
+    if not vendor_name:
+        return None
+    vendor_token = _normalize_token(vendor_name)
+    if not vendor_token:
+        return None
+
+    page_size = 200
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+        start_position = ((page - 1) * page_size) + 1
+        response = await quickbooks_get_vendors(
+            token,
+            realm_id,
+            start_position=start_position,
+            max_results=page_size,
+        )
+        rows = (response.get("QueryResponse") or {}).get("Vendor") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            probe_tokens = {
+                _normalize_token(row.get("Id")),
+                _normalize_token(row.get("DisplayName")),
+                _normalize_token(row.get("CompanyName")),
+                _normalize_token(row.get("PrintOnCheckName")),
+            }
+            if vendor_token in {t for t in probe_tokens if t}:
+                resolved = _as_text(row.get("Id"))
+                if resolved:
+                    return resolved
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _resolve_free_agent_contact_url(
+    token: dict[str, Any],
+    subdomain: str,
+    payload: dict[str, Any],
+) -> str | None:
+    direct = _coalesce_text(payload, "contact_url", "contact_id")
+    if direct and direct.startswith("http"):
+        return direct
+
+    candidate_values = [
+        _coalesce_text(payload, "contact_id"),
+        _coalesce_text(payload, "vendor"),
+        _coalesce_text(payload, "contact_name"),
+    ]
+    candidate_tokens = {_normalize_token(v) for v in candidate_values if v}
+    if not candidate_tokens:
+        return None
+
+    page_size = 100
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+        response = await free_agent_get_clients(
+            token,
+            page=page,
+            per_page=page_size,
+        )
+        rows = response.get("clients") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            probe_tokens = {
+                _normalize_token(row.get("url")),
+                _normalize_token(row.get("id")),
+                _normalize_token(row.get("subdomain")),
+                _normalize_token(row.get("organisation_name")),
+                _normalize_token(row.get("company_name")),
+                _normalize_token(row.get("name")),
+            }
+            if candidate_tokens.intersection({t for t in probe_tokens if t}):
+                url_value = _as_text(row.get("url"))
+                if url_value:
+                    return url_value
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _resolve_free_agent_category(
+    token: dict[str, Any],
+    subdomain: str,
+    payload: dict[str, Any],
+) -> tuple[str | None, dict[str, Any] | None]:
+    direct = _coalesce_text(payload, "account_platform_record_id")
+    if direct and direct.startswith("http"):
+        return direct, None
+
+    categories_payload = await free_agent_get_categories(token, subdomain)
+    rows = categories_payload.get("categories") or []
+
+    candidates = [
+        _coalesce_text(payload, "account_code"),
+        _coalesce_text(payload, "account_name"),
+        _coalesce_text(payload, "category"),
+        _coalesce_text(payload, "account_platform_record_id"),
+    ]
+    candidate_tokens = {_normalize_token(v) for v in candidates if v}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_url = _as_text(row.get("url"))
+        probe_tokens = {
+            _normalize_token(row_url),
+            _normalize_token(row.get("id")),
+            _normalize_token(row.get("nominal_code")),
+            _normalize_token(row.get("code")),
+            _normalize_token(row.get("category")),
+            _normalize_token(row.get("description")),
+            _normalize_token(row.get("name")),
+        }
+        if candidate_tokens and candidate_tokens.intersection({t for t in probe_tokens if t}):
+            return row_url or None, row
+
+    if rows:
+        first = rows[0] if isinstance(rows[0], dict) else {}
+        return _as_text(first.get("url")) or None, first if isinstance(first, dict) else None
+    return None, None
+
+
+def _build_xero_invoice_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    vendor = _coalesce_text(payload, "vendor", "contact_name") or "Unknown vendor"
+    contact_id = _coalesce_text(payload, "contact_id")
+    contact: dict[str, Any] = {}
+    if contact_id and re.fullmatch(r"[0-9a-fA-F-]{32,36}", contact_id):
+        contact["ContactID"] = contact_id
+    else:
+        contact["Name"] = vendor
+
+    line_items: list[dict[str, Any]] = []
+    for item in _extract_publish_line_items(payload):
+        row: dict[str, Any] = {}
+        if item.get("description"):
+            row["Description"] = item["description"]
+        if item.get("quantity") is not None:
+            row["Quantity"] = item["quantity"]
+        if item.get("unit_amount") is not None:
+            row["UnitAmount"] = item["unit_amount"]
+        if item.get("amount") is not None:
+            row["LineAmount"] = item["amount"]
+        account_code = _coalesce_text(item, "account_code") or _coalesce_text(payload, "account_code")
+        if account_code:
+            row["AccountCode"] = account_code
+        tax_code = _coalesce_text(item, "tax_code") or _coalesce_text(payload, "tax_code")
+        if tax_code:
+            row["TaxType"] = tax_code
+        if row:
+            line_items.append(row)
+
+    invoice: dict[str, Any] = {
+        "Type": "ACCPAY",
+        "Status": "DRAFT",
+        "LineAmountTypes": "Exclusive",
+        "Contact": contact,
+        "LineItems": line_items or [{"Description": _coalesce_text(payload, "description", "summary") or vendor, "Quantity": 1}],
+    }
+    invoice_date = _normalize_date(_coalesce_text(payload, "invoice_date", "date"))
+    due_on = _normalize_date(_coalesce_text(payload, "due_on", "due_date"))
+    invoice_number = _coalesce_text(payload, "invoice_number")
+    reference = _coalesce_text(payload, "reference")
+    currency = _coalesce_text(payload, "currency")
+    if invoice_date:
+        invoice["Date"] = invoice_date
+    if due_on:
+        invoice["DueDate"] = due_on
+    if invoice_number:
+        invoice["InvoiceNumber"] = invoice_number
+    if reference:
+        invoice["Reference"] = reference
+    if currency:
+        invoice["CurrencyCode"] = currency.upper()
+    return invoice
+
+
+def _build_quickbooks_bill_payload(
+    payload: dict[str, Any],
+    *,
+    vendor_ref: str,
+    account_ref: str,
+    tax_code_ref: str | None,
+) -> dict[str, Any]:
+    lines: list[dict[str, Any]] = []
+    for item in _extract_publish_line_items(payload):
+        amount = _to_float(item.get("amount"))
+        if amount is None:
+            continue
+        detail: dict[str, Any] = {"AccountRef": {"value": account_ref}}
+        if tax_code_ref:
+            detail["TaxCodeRef"] = {"value": tax_code_ref}
+        row: dict[str, Any] = {
+            "Amount": amount,
+            "DetailType": "AccountBasedExpenseLineDetail",
+            "AccountBasedExpenseLineDetail": detail,
+        }
+        description = _as_text(item.get("description"))
+        if description:
+            row["Description"] = description
+        lines.append(row)
+
+    if not lines:
+        fallback_amount = _coalesce_float(payload, "amount", "total")
+        if fallback_amount is not None:
+            lines.append(
+                {
+                    "Amount": fallback_amount,
+                    "DetailType": "AccountBasedExpenseLineDetail",
+                    "AccountBasedExpenseLineDetail": {"AccountRef": {"value": account_ref}},
+                    "Description": _coalesce_text(payload, "description", "summary") or "",
+                }
+            )
+
+    bill: dict[str, Any] = {
+        "VendorRef": {"value": vendor_ref},
+        "Line": lines,
+    }
+    invoice_date = _normalize_date(_coalesce_text(payload, "invoice_date", "date"))
+    due_on = _normalize_date(_coalesce_text(payload, "due_on", "due_date"))
+    invoice_number = _coalesce_text(payload, "invoice_number")
+    description = _coalesce_text(payload, "description")
+    currency = _coalesce_text(payload, "currency")
+    if invoice_date:
+        bill["TxnDate"] = invoice_date
+    if due_on:
+        bill["DueDate"] = due_on
+    if invoice_number:
+        bill["DocNumber"] = invoice_number
+    if description:
+        bill["PrivateNote"] = description
+    if currency:
+        bill["CurrencyRef"] = {"value": currency.upper()}
+    return bill
+
+
+def _build_free_agent_bill_payload(
+    payload: dict[str, Any],
+    *,
+    contact_url: str,
+    category_url: str,
+    default_tax_rate: float | None = None,
+) -> dict[str, Any]:
+    bill_items: list[dict[str, Any]] = []
+    for item in _extract_publish_line_items(payload):
+        amount = _to_float(item.get("amount"))
+        if amount is None:
+            continue
+        row: dict[str, Any] = {
+            "category": category_url,
+            "total_value": f"{amount:.2f}",
+        }
+        description = _as_text(item.get("description"))
+        if description:
+            row["description"] = description
+        tax_rate = _to_float(item.get("tax"))
+        if tax_rate is None:
+            tax_rate = default_tax_rate
+        if tax_rate is not None:
+            row["sales_tax_rate"] = tax_rate
+        bill_items.append(row)
+
+    if not bill_items:
+        amount = _coalesce_float(payload, "amount", "total")
+        if amount is not None:
+            fallback: dict[str, Any] = {
+                "category": category_url,
+                "total_value": f"{amount:.2f}",
+            }
+            description = _coalesce_text(payload, "description", "summary")
+            if description:
+                fallback["description"] = description
+            if default_tax_rate is not None:
+                fallback["sales_tax_rate"] = default_tax_rate
+            bill_items.append(fallback)
+
+    bill: dict[str, Any] = {
+        "contact": contact_url,
+        "bill_items": bill_items,
+    }
+    dated_on = _normalize_date(_coalesce_text(payload, "invoice_date", "date"))
+    due_on = _normalize_date(_coalesce_text(payload, "due_on", "due_date"))
+    reference = _coalesce_text(payload, "invoice_number", "reference")
+    currency = _coalesce_text(payload, "currency")
+    if dated_on:
+        bill["dated_on"] = dated_on
+    if due_on:
+        bill["due_on"] = due_on
+    if reference:
+        bill["reference"] = reference
+    if currency:
+        bill["currency"] = currency.upper()
+    return bill
+
+
 async def _create_oauth_state(
     db: AsyncSession,
     provider: str,
@@ -408,6 +906,7 @@ async def _upsert_connection(
         select(AccountingConnection).where(
             AccountingConnection.business_profile_id == str(business_profile_id),
             AccountingConnection.provider == provider,
+            AccountingConnection.user_id == str(user_id),
         )
     )
     existing = res.scalars().first()
@@ -448,11 +947,17 @@ async def _upsert_connection(
     return conn
 
 
-async def _get_connection(db: AsyncSession, business_profile_id: UUID, provider: str) -> AccountingConnection | None:
+async def _get_connection(
+    db: AsyncSession,
+    business_profile_id: UUID,
+    provider: str,
+    user_id: UUID,
+) -> AccountingConnection | None:
     res = await db.execute(
         select(AccountingConnection).where(
             AccountingConnection.business_profile_id == str(business_profile_id),
             AccountingConnection.provider == provider,
+            AccountingConnection.user_id == str(user_id),
         )
     )
     return res.scalars().first()
@@ -545,11 +1050,11 @@ async def exchange(provider: str, body: ExchangeIn) -> dict[str, Any]:
     dependencies=[Depends(require_internal_api_key)],
     response_model=OAuthStatusOut,
 )
-async def status(provider: str, business_profile_id: UUID) -> OAuthStatusOut:
+async def status(provider: str, business_profile_id: UUID, user_id: UUID) -> OAuthStatusOut:
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
-        conn = await _get_connection(db, business_profile_id, provider)
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
         if not conn:
             return OAuthStatusOut(status="not_connected")
         return OAuthStatusOut(status="connected", tenant_id=conn.tenant_id, tenant_name=conn.tenant_name)
@@ -564,6 +1069,7 @@ async def disconnect(provider: str, body: DisconnectIn) -> dict[str, Any]:
             delete(AccountingConnection).where(
                 AccountingConnection.business_profile_id == str(body.business_profile_id),
                 AccountingConnection.provider == provider,
+                AccountingConnection.user_id == str(body.user_id),
             )
         )
         await db.commit()
@@ -599,7 +1105,13 @@ async def trigger_sync(provider: str, body: SyncIn) -> dict[str, Any]:
             "provider": provider,
             "sync_types": normalized_sync_types,
         },
-        idempotency_key=f"accountingcli:{provider}:{body.business_profile_id}:{','.join(sorted(normalized_sync_types))}",
+        idempotency_key=(
+            "accountingcli:"
+            f"{provider}:"
+            f"{body.business_profile_id}:"
+            f"{body.user_id}:"
+            f"{','.join(sorted(normalized_sync_types))}"
+        ),
         user_id=str(body.user_id),
     )
     run_ids = event.get("run_ids") or []
@@ -619,15 +1131,123 @@ async def trigger_sync(provider: str, body: SyncIn) -> dict[str, Any]:
     return {"choreo_run_id": choreo_run_id}
 
 
+@app.post("/internal/publish/{provider}", dependencies=[Depends(require_internal_api_key)])
+async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    if provider == "sage":
+        raise HTTPException(status_code=400, detail="Sage publish is unsupported in this release")
+
+    payload = dict(body.payload or {})
+
+    async for db in session_scope():
+        conn = await _get_connection(db, body.business_profile_id, provider, body.user_id)
+        if not conn:
+            raise HTTPException(status_code=404, detail=f"No {provider} connection for this user/profile")
+
+        try:
+            token = await _maybe_refresh_connection_token(db, conn)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to refresh {provider} token: {exc}") from exc
+
+        if provider == "xero":
+            tenant_id = await _resolve_xero_tenant_id(db, conn, token)
+            if not tenant_id:
+                raise HTTPException(status_code=422, detail="Missing Xero tenant_id")
+            invoice = _build_xero_invoice_payload(payload)
+            response = await xero_create_invoices(token, tenant_id, [invoice])
+            rows = response.get("Invoices") or []
+            first = rows[0] if rows and isinstance(rows[0], dict) else {}
+            provider_record_id = _as_text(first.get("InvoiceID")) or None
+            return {
+                "published": True,
+                "provider": provider,
+                "provider_record_id": provider_record_id,
+                "reference": _as_text(first.get("InvoiceNumber") or first.get("Reference")) or None,
+                "idempotency_key": body.idempotency_key,
+                "raw": first if first else response,
+            }
+
+        if provider == "quickbooks":
+            realm_id = _resolve_quickbooks_realm_id(conn, token)
+            if not realm_id:
+                raise HTTPException(status_code=422, detail="Missing QuickBooks realm_id")
+            vendor_ref = await _resolve_quickbooks_vendor_ref(token, realm_id, payload)
+            if not vendor_ref:
+                raise HTTPException(status_code=422, detail="Unable to resolve QuickBooks vendor reference")
+            account_ref = await _resolve_quickbooks_account_ref(token, realm_id, payload)
+            if not account_ref:
+                raise HTTPException(status_code=422, detail="Unable to resolve QuickBooks account reference")
+            tax_code_ref = await _resolve_quickbooks_tax_code_ref(token, realm_id, payload)
+            bill_payload = _build_quickbooks_bill_payload(
+                payload,
+                vendor_ref=vendor_ref,
+                account_ref=account_ref,
+                tax_code_ref=tax_code_ref,
+            )
+            response = await quickbooks_create_bill(token, realm_id, bill_payload)
+            bill = response.get("Bill") if isinstance(response, dict) else {}
+            if not isinstance(bill, dict):
+                bill = {}
+            provider_record_id = _as_text(bill.get("Id")) or None
+            return {
+                "published": True,
+                "provider": provider,
+                "provider_record_id": provider_record_id,
+                "reference": _as_text(bill.get("DocNumber")) or None,
+                "idempotency_key": body.idempotency_key,
+                "raw": bill if bill else response,
+            }
+
+        if provider == "free_agent":
+            subdomain = await _resolve_free_agent_subdomain(db, conn, token)
+            if not subdomain:
+                raise HTTPException(status_code=422, detail="Missing FreeAgent subdomain")
+            contact_url = await _resolve_free_agent_contact_url(token, subdomain, payload)
+            if not contact_url:
+                raise HTTPException(status_code=422, detail="Unable to resolve FreeAgent contact URL")
+            category_url, category_row = await _resolve_free_agent_category(token, subdomain, payload)
+            if not category_url:
+                raise HTTPException(status_code=422, detail="Unable to resolve FreeAgent category URL")
+            default_tax_rate = _to_float(payload.get("tax"))
+            if default_tax_rate is None and isinstance(category_row, dict):
+                default_tax_rate = _to_float(category_row.get("auto_sales_tax_rate"))
+            bill_payload = _build_free_agent_bill_payload(
+                payload,
+                contact_url=contact_url,
+                category_url=category_url,
+                default_tax_rate=default_tax_rate,
+            )
+            response = await free_agent_create_bill(token, subdomain, bill_payload)
+            bill = response.get("bill") if isinstance(response, dict) else {}
+            if not isinstance(bill, dict):
+                bill = {}
+            provider_record_id = _as_text(bill.get("url") or bill.get("id")) or None
+            return {
+                "published": True,
+                "provider": provider,
+                "provider_record_id": provider_record_id,
+                "reference": _as_text(bill.get("reference")) or None,
+                "idempotency_key": body.idempotency_key,
+                "raw": bill if bill else response,
+            }
+
+        raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+
+
 @app.get("/internal/data/bank-transactions", dependencies=[Depends(require_internal_api_key)])
 async def list_bank_transactions(
     business_profile_id: UUID,
     provider: str,
+    user_id: UUID,
     since: str | None = None,
 ) -> list[dict[str, Any]]:
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
+        if not conn:
+            return []
         q = select(BankTransaction).where(
             BankTransaction.business_profile_id == str(business_profile_id),
             BankTransaction.provider == provider,
@@ -657,11 +1277,15 @@ async def list_bank_transactions(
 async def list_invoices(
     business_profile_id: UUID,
     provider: str,
+    user_id: UUID,
     since: str | None = None,
 ) -> list[dict[str, Any]]:
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
     async for db in session_scope():
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
+        if not conn:
+            return []
         q = select(Invoice).where(
             Invoice.business_profile_id == str(business_profile_id),
             Invoice.provider == provider,
@@ -695,6 +1319,7 @@ async def list_invoices(
 async def list_account_codes(
     business_profile_id: UUID,
     provider: str,
+    user_id: UUID,
 ) -> list[dict[str, Any]]:
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
@@ -702,7 +1327,7 @@ async def list_account_codes(
         return []
 
     async for db in session_scope():
-        conn = await _get_connection(db, business_profile_id, provider)
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
         if not conn:
             return []
 
@@ -757,6 +1382,7 @@ async def list_account_codes(
 async def list_tax_codes(
     business_profile_id: UUID,
     provider: str,
+    user_id: UUID,
 ) -> list[dict[str, Any]]:
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported provider")
@@ -764,7 +1390,7 @@ async def list_tax_codes(
         return []
 
     async for db in session_scope():
-        conn = await _get_connection(db, business_profile_id, provider)
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
         if not conn:
             return []
 

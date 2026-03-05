@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # Xero
     XERO_CLIENT_ID: str = ""
     XERO_CLIENT_SECRET: str = ""
-    XERO_SCOPE: str = "offline_access accounting.transactions.read accounting.settings.read accounting.contacts.read"
+    XERO_SCOPE: str = "openid profile email offline_access accounting.transactions accounting.transactions.read accounting.settings accounting.settings.read accounting.contacts accounting.contacts.read accounting.attachments accounting.attachments.read"
     XERO_AUTHORIZATION_URL: str = "https://login.xero.com/identity/connect/authorize"
     XERO_TOKEN_URL: str = "https://identity.xero.com/connect/token"
     XERO_REVOKE_TOKEN_URL: str = ""
