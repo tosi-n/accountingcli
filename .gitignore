@@ -1,5 +1,8 @@
 .env
 .env.*
+.venv*/
+venv*/
+env*/
 *.db
 *.sqlite
 __pycache__/
@@ -9,4 +12,3 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
-

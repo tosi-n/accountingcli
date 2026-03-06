@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 import urllib.parse
 from typing import Any
@@ -18,6 +19,12 @@ def _calc_expires_at(token: dict[str, Any]) -> dict[str, Any]:
     if "expires_in" in token and "expires_at" not in token:
         token["expires_at"] = _now_ts() + int(token["expires_in"])
     return token
+
+
+def _preserve_refresh_token(token: dict[str, Any], previous_refresh_token: str) -> dict[str, Any]:
+    if not str(token.get("refresh_token") or "").strip():
+        token["refresh_token"] = previous_refresh_token
+    return _calc_expires_at(token)
 
 
 def build_redirect_uri(provider: str) -> str:
@@ -141,9 +148,7 @@ async def refresh_token(provider: str, refresh_token_value: str) -> dict[str, An
                 headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
             )
             resp.raise_for_status()
-            tok = resp.json()
-            tok["refresh_token"] = refresh_token_value
-            return _calc_expires_at(tok)
+            return _preserve_refresh_token(resp.json(), refresh_token_value)
 
     if provider == "quickbooks":
         basic = base64.b64encode(f"{settings.QUICKBOOKS_CLIENT_ID}:{settings.QUICKBOOKS_CLIENT_SECRET}".encode("utf-8")).decode("utf-8")
@@ -155,9 +160,7 @@ async def refresh_token(provider: str, refresh_token_value: str) -> dict[str, An
                 headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
             )
             resp.raise_for_status()
-            tok = resp.json()
-            tok["refresh_token"] = refresh_token_value
-            return _calc_expires_at(tok)
+            return _preserve_refresh_token(resp.json(), refresh_token_value)
 
     if provider == "sage":
         data = {
@@ -169,9 +172,7 @@ async def refresh_token(provider: str, refresh_token_value: str) -> dict[str, An
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(settings.SAGE_TOKEN_URL, data=data)
             resp.raise_for_status()
-            tok = resp.json()
-            tok["refresh_token"] = refresh_token_value
-            return _calc_expires_at(tok)
+            return _preserve_refresh_token(resp.json(), refresh_token_value)
 
     if provider == "free_agent":
         data = {
@@ -183,9 +184,7 @@ async def refresh_token(provider: str, refresh_token_value: str) -> dict[str, An
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(settings.FREE_AGENT_TOKEN_URL, data=data)
             resp.raise_for_status()
-            tok = resp.json()
-            tok["refresh_token"] = refresh_token_value
-            return _calc_expires_at(tok)
+            return _preserve_refresh_token(resp.json(), refresh_token_value)
 
     raise ValueError(f"unknown provider: {provider}")
 
@@ -328,6 +327,17 @@ async def free_agent_get_categories(
     return await free_agent_api_get("/v2/categories", token, subdomain=subdomain)
 
 
+async def free_agent_get_bank_accounts(
+    token: dict[str, Any],
+    subdomain: str,
+    *,
+    page: int = 1,
+    per_page: int = 100,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    return await free_agent_api_get("/v2/bank_accounts", token, subdomain=subdomain, params=params)
+
+
 def _quickbooks_base_url() -> str:
     env = (settings.QUICKBOOKS_ENV or "").strip().lower()
     if env == "production":
@@ -449,6 +459,60 @@ async def xero_create_invoices(
         return resp.json()
 
 
+async def xero_upload_invoice_attachment(
+    token: dict[str, Any],
+    tenant_id: str,
+    invoice_id: str,
+    *,
+    filename: str,
+    content: bytes,
+    content_type: str = "application/octet-stream",
+    include_online: bool = False,
+) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "Content-Type": content_type or "application/octet-stream",
+        "xero-tenant-id": tenant_id,
+    }
+    encoded_filename = urllib.parse.quote(filename, safe="")
+    params = {"IncludeOnline": str(bool(include_online)).lower()}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            urllib.parse.urljoin(
+                settings.XERO_BASE_URL,
+                f"/api.xro/2.0/Invoices/{invoice_id}/Attachments/{encoded_filename}",
+            ),
+            headers=headers,
+            params=params,
+            content=content,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def xero_create_payments(
+    token: dict[str, Any],
+    tenant_id: str,
+    payments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "xero-tenant-id": tenant_id,
+    }
+    payload = {"Payments": payments}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.put(
+            urllib.parse.urljoin(settings.XERO_BASE_URL, "/api.xro/2.0/Payments"),
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def quickbooks_get_vendors(
     token: dict[str, Any],
     realm_id: str,
@@ -480,6 +544,67 @@ async def quickbooks_create_bill(
         return resp.json()
 
 
+async def quickbooks_upload_attachment(
+    token: dict[str, Any],
+    realm_id: str,
+    *,
+    entity_type: str,
+    entity_id: str,
+    filename: str,
+    content: bytes,
+    content_type: str = "application/octet-stream",
+    note: str | None = None,
+    minorversion: int = 70,
+) -> dict[str, Any]:
+    url = urllib.parse.urljoin(_quickbooks_base_url(), f"/v3/company/{realm_id}/upload")
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+    }
+    params = {"minorversion": minorversion}
+    metadata: dict[str, Any] = {
+        "AttachableRef": [
+            {
+                "EntityRef": {
+                    "type": entity_type,
+                    "value": entity_id,
+                }
+            }
+        ],
+        "FileName": filename,
+    }
+    if note:
+        metadata["Note"] = note
+    files = {
+        "file_metadata_01": (None, json.dumps({"Attachable": metadata}), "application/json"),
+        "file_content_01": (filename, content, content_type or "application/octet-stream"),
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(url, headers=headers, params=params, files=files)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def quickbooks_create_bill_payment(
+    token: dict[str, Any],
+    realm_id: str,
+    payment: dict[str, Any],
+    *,
+    minorversion: int = 70,
+) -> dict[str, Any]:
+    url = urllib.parse.urljoin(_quickbooks_base_url(), f"/v3/company/{realm_id}/billpayment")
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    params = {"minorversion": minorversion}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, headers=headers, params=params, json=payment)
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def free_agent_api_post(
     path: str,
     token: dict[str, Any],
@@ -507,3 +632,16 @@ async def free_agent_create_bill(
     bill: dict[str, Any],
 ) -> dict[str, Any]:
     return await free_agent_api_post("/v2/bills", token, subdomain=subdomain, payload={"bill": bill})
+
+
+async def free_agent_create_bank_transaction_explanation(
+    token: dict[str, Any],
+    subdomain: str,
+    explanation: dict[str, Any],
+) -> dict[str, Any]:
+    return await free_agent_api_post(
+        "/v2/bank_transaction_explanations",
+        token,
+        subdomain=subdomain,
+        payload={"bank_transaction_explanation": explanation},
+    )

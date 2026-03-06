@@ -9,6 +9,7 @@ import urllib.parse
 from typing import Any
 from uuid import UUID
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
@@ -22,18 +23,25 @@ from app.providers import (
     build_authorize_url,
     exchange_code,
     free_agent_create_bill,
+    free_agent_create_bank_transaction_explanation,
+    free_agent_get_bank_accounts,
+    free_agent_get_bank_transactions,
     free_agent_get_categories,
     free_agent_get_clients,
     quickbooks_create_bill,
+    quickbooks_create_bill_payment,
     quickbooks_get_accounts,
+    quickbooks_upload_attachment,
     quickbooks_get_vendors,
     quickbooks_get_tax_codes,
     quickbooks_get_tax_rates,
     refresh_token as provider_refresh_token,
+    xero_create_payments,
     xero_create_invoices,
     xero_get_accounts,
     xero_get_connections,
     xero_get_tax_rates,
+    xero_upload_invoice_attachment,
 )
 from app.settings import settings
 
@@ -401,6 +409,81 @@ def _coalesce_float(payload: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _coalesce_bool(payload: dict[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+        text = _as_text(value).lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
+def _extract_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("attachments")
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        url = _coalesce_text(row, "url", "access_url", "signed_url", "download_url")
+        filename = _coalesce_text(row, "filename", "name", "storage_key")
+        if filename:
+            filename = os.path.basename(filename)
+        content_type = _coalesce_text(row, "content_type", "mime_type") or "application/octet-stream"
+        if not url or not filename:
+            continue
+        out.append(
+            {
+                "document_id": _coalesce_text(row, "document_id"),
+                "url": url,
+                "filename": filename,
+                "content_type": content_type,
+                "kind": _coalesce_text(row, "kind", "document_kind"),
+                "content_base64": _coalesce_text(row, "content_base64"),
+            }
+        )
+    return out
+
+
+def _extract_payment_request(payload: dict[str, Any]) -> dict[str, Any] | None:
+    raw = payload.get("payment")
+    payment = dict(raw) if isinstance(raw, dict) else {}
+    mark_paid = _coalesce_bool(payment, "mark_paid")
+    if mark_paid is None:
+        mark_paid = _coalesce_bool(payload, "mark_paid")
+    if not mark_paid:
+        return None
+    amount = _coalesce_float(payment, "amount") or _coalesce_float(payload, "amount", "total")
+    payment_date = _normalize_date(_coalesce_text(payment, "payment_date", "date") or _coalesce_text(payload, "payment_date", "date", "invoice_date"))
+    bank_account = _coalesce_text(payment, "bank_account_name", "bank_account") or _coalesce_text(payload, "bank_account")
+    bank_account_id = _coalesce_text(payment, "bank_account_id", "account_id")
+    reference = _coalesce_text(payment, "reference") or _coalesce_text(payload, "reference", "invoice_number")
+    return {
+        "mark_paid": True,
+        "amount": amount,
+        "payment_date": payment_date,
+        "bank_account": bank_account,
+        "bank_account_id": bank_account_id,
+        "reference": reference,
+    }
+
+
+async def _download_attachment_entry(entry: dict[str, Any]) -> tuple[bytes, str]:
+    url = _coalesce_text(entry, "url")
+    if not url:
+        raise RuntimeError("Attachment entry is missing url")
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type") or _coalesce_text(entry, "content_type") or "application/octet-stream"
+        return response.content, content_type.split(";", 1)[0].strip() or "application/octet-stream"
+
+
 def _extract_publish_line_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raw_items = payload.get("line_items")
     out: list[dict[str, Any]] = []
@@ -483,6 +566,56 @@ async def _resolve_quickbooks_account_ref(
                 _normalize_token(row.get("FullyQualifiedName")),
             }
             if candidate_tokens.intersection({t for t in probe_tokens if t}):
+                resolved = _as_text(row.get("Id"))
+                if resolved:
+                    return resolved
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _resolve_quickbooks_bank_account_ref(
+    token: dict[str, Any],
+    realm_id: str,
+    payload: dict[str, Any],
+) -> str | None:
+    direct = _coalesce_text(payload, "bank_account_id")
+    if direct:
+        return direct
+
+    candidate = _coalesce_text(payload, "bank_account")
+    if not candidate:
+        return None
+    candidate_token = _normalize_token(candidate)
+    if not candidate_token:
+        return None
+
+    page_size = 200
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+        start_position = ((page - 1) * page_size) + 1
+        response = await quickbooks_get_accounts(
+            token,
+            realm_id,
+            start_position=start_position,
+            max_results=page_size,
+        )
+        rows = (response.get("QueryResponse") or {}).get("Account") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            account_type = _normalize_token(row.get("AccountType"))
+            if account_type not in {"bank", "creditcard"}:
+                continue
+            probe_tokens = {
+                _normalize_token(row.get("Id")),
+                _normalize_token(row.get("AcctNum")),
+                _normalize_token(row.get("Name")),
+                _normalize_token(row.get("FullyQualifiedName")),
+            }
+            if candidate_token in {t for t in probe_tokens if t}:
                 resolved = _as_text(row.get("Id"))
                 if resolved:
                     return resolved
@@ -675,6 +808,109 @@ async def _resolve_free_agent_category(
     return None, None
 
 
+async def _resolve_xero_bank_account(
+    token: dict[str, Any],
+    tenant_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    direct = _coalesce_text(payload, "bank_account_id")
+    candidate_values = [direct, _coalesce_text(payload, "bank_account")]
+    candidate_tokens = {_normalize_token(v) for v in candidate_values if v}
+    if not candidate_tokens:
+        return None
+
+    response = await xero_get_accounts(token, tenant_id)
+    rows = response.get("Accounts") or []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if _normalize_token(row.get("Type")) != "bank":
+            continue
+        probe_tokens = {
+            _normalize_token(row.get("AccountID")),
+            _normalize_token(row.get("Code")),
+            _normalize_token(row.get("Name")),
+        }
+        if candidate_tokens.intersection({t for t in probe_tokens if t}):
+            return row
+    return None
+
+
+async def _resolve_free_agent_bank_account(
+    token: dict[str, Any],
+    subdomain: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    direct = _coalesce_text(payload, "bank_account_id")
+    candidate = _coalesce_text(payload, "bank_account")
+    candidate_tokens = {_normalize_token(v) for v in (direct, candidate) if v}
+    if not candidate_tokens:
+        return None
+
+    page_size = 100
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+        response = await free_agent_get_bank_accounts(token, subdomain, page=page, per_page=page_size)
+        rows = response.get("bank_accounts") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            probe_tokens = {
+                _normalize_token(row.get("url")),
+                _normalize_token(row.get("id")),
+                _normalize_token(row.get("name")),
+                _normalize_token(row.get("bank_name")),
+            }
+            if candidate_tokens.intersection({t for t in probe_tokens if t}):
+                return row
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _resolve_free_agent_bank_transaction_url(
+    token: dict[str, Any],
+    subdomain: str,
+    *,
+    bank_account: dict[str, Any],
+    payment_amount: float | None,
+    payment_date: str | None,
+) -> str | None:
+    bank_account_url = _as_text(bank_account.get("url"))
+    if not bank_account_url:
+        return None
+
+    page_size = 100
+    max_pages = 20
+    normalized_amount = round(float(payment_amount or 0.0), 2) if payment_amount is not None else None
+    for page in range(1, max_pages + 1):
+        response = await free_agent_get_bank_transactions(token, subdomain, page=page, per_page=page_size)
+        rows = response.get("bank_transactions") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if _as_text((row.get("bank_account") or {}).get("url")) != bank_account_url and _as_text(row.get("bank_account")) != bank_account_url:
+                continue
+            if payment_date:
+                row_date = _normalize_date(row.get("dated_on") or row.get("date"))
+                if row_date != payment_date:
+                    continue
+            if normalized_amount is not None:
+                candidate_amount = _to_float(row.get("amount") or row.get("gross_value") or row.get("value"))
+                if candidate_amount is None or round(candidate_amount, 2) != normalized_amount:
+                    continue
+            url_value = _as_text(row.get("url"))
+            if url_value:
+                return url_value
+        if len(rows) < page_size:
+            break
+    return None
+
+
 def _build_xero_invoice_payload(payload: dict[str, Any]) -> dict[str, Any]:
     vendor = _coalesce_text(payload, "vendor", "contact_name") or "Unknown vendor"
     contact_id = _coalesce_text(payload, "contact_id")
@@ -704,9 +940,18 @@ def _build_xero_invoice_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if row:
             line_items.append(row)
 
+    xero_status = "DRAFT"
+    requested_status = _coalesce_text(payload, "publish_status", "status")
+    if _coalesce_bool(payload, "mark_paid") or _coalesce_bool(payload.get("payment") if isinstance(payload.get("payment"), dict) else {}, "mark_paid"):
+        xero_status = "AUTHORISED"
+    elif requested_status:
+        normalized_status = requested_status.strip().upper()
+        if normalized_status in {"DRAFT", "AUTHORISED", "SUBMITTED"}:
+            xero_status = normalized_status
+
     invoice: dict[str, Any] = {
         "Type": "ACCPAY",
-        "Status": "DRAFT",
+        "Status": xero_status,
         "LineAmountTypes": "Exclusive",
         "Contact": contact,
         "LineItems": line_items or [{"Description": _coalesce_text(payload, "description", "summary") or vendor, "Quantity": 1}],
@@ -844,7 +1089,94 @@ def _build_free_agent_bill_payload(
         bill["reference"] = reference
     if currency:
         bill["currency"] = currency.upper()
+    attachments = _extract_attachments(payload)
+    if attachments:
+        attachment = attachments[0]
+        encoded_content = _coalesce_text(attachment, "content_base64")
+        if encoded_content:
+            bill["attachment_name"] = _coalesce_text(attachment, "filename")
+            bill["attachment_data"] = encoded_content
     return bill
+
+
+async def _upload_xero_attachments(
+    token: dict[str, Any],
+    tenant_id: str,
+    invoice_id: str,
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for entry in attachments:
+        filename = _coalesce_text(entry, "filename") or "attachment"
+        try:
+            content, content_type = await _download_attachment_entry(entry)
+            response = await xero_upload_invoice_attachment(
+                token,
+                tenant_id,
+                invoice_id,
+                filename=filename,
+                content=content,
+                content_type=content_type,
+            )
+            results.append(
+                {
+                    "document_id": _coalesce_text(entry, "document_id") or None,
+                    "filename": filename,
+                    "status": "uploaded",
+                    "raw": response,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "document_id": _coalesce_text(entry, "document_id") or None,
+                    "filename": filename,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+    return results
+
+
+async def _upload_quickbooks_attachments(
+    token: dict[str, Any],
+    realm_id: str,
+    bill_id: str,
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for entry in attachments:
+        filename = _coalesce_text(entry, "filename") or "attachment"
+        try:
+            content, content_type = await _download_attachment_entry(entry)
+            response = await quickbooks_upload_attachment(
+                token,
+                realm_id,
+                entity_type="Bill",
+                entity_id=bill_id,
+                filename=filename,
+                content=content,
+                content_type=content_type,
+                note=_coalesce_text(entry, "kind") or None,
+            )
+            results.append(
+                {
+                    "document_id": _coalesce_text(entry, "document_id") or None,
+                    "filename": filename,
+                    "status": "uploaded",
+                    "raw": response,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "document_id": _coalesce_text(entry, "document_id") or None,
+                    "filename": filename,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+    return results
 
 
 async def _create_oauth_state(
@@ -1139,6 +1471,8 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Sage publish is unsupported in this release")
 
     payload = dict(body.payload or {})
+    attachments = _extract_attachments(payload)
+    payment_request = _extract_payment_request(payload)
 
     async for db in session_scope():
         conn = await _get_connection(db, body.business_profile_id, provider, body.user_id)
@@ -1154,17 +1488,58 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             tenant_id = await _resolve_xero_tenant_id(db, conn, token)
             if not tenant_id:
                 raise HTTPException(status_code=422, detail="Missing Xero tenant_id")
-            invoice = _build_xero_invoice_payload(payload)
+            publish_payload = dict(payload)
+            if payment_request:
+                publish_payload["payment"] = payment_request
+                publish_payload["mark_paid"] = True
+            invoice = _build_xero_invoice_payload(publish_payload)
             response = await xero_create_invoices(token, tenant_id, [invoice])
             rows = response.get("Invoices") or []
             first = rows[0] if rows and isinstance(rows[0], dict) else {}
             provider_record_id = _as_text(first.get("InvoiceID")) or None
+            attachment_results: list[dict[str, Any]] = []
+            if provider_record_id and attachments:
+                attachment_results = await _upload_xero_attachments(token, tenant_id, provider_record_id, attachments)
+            payment_result: dict[str, Any] | None = None
+            if provider_record_id and payment_request:
+                payment_result = {"attempted": True, "status": "failed"}
+                try:
+                    bank_account = await _resolve_xero_bank_account(token, tenant_id, payment_request)
+                    if not isinstance(bank_account, dict):
+                        raise RuntimeError("Unable to resolve Xero bank account for payment")
+                    amount = _to_float(payment_request.get("amount"))
+                    if amount is None:
+                        raise RuntimeError("Missing payment amount")
+                    payment_payload: dict[str, Any] = {
+                        "Invoice": {"InvoiceID": provider_record_id},
+                        "Account": {"AccountID": _as_text(bank_account.get("AccountID"))},
+                        "Amount": amount,
+                    }
+                    payment_date = _normalize_date(payment_request.get("payment_date")) or _normalize_date(first.get("Date")) or _normalize_date(payload.get("invoice_date"))
+                    if payment_date:
+                        payment_payload["Date"] = payment_date
+                    reference = _coalesce_text(payment_request, "reference")
+                    if reference:
+                        payment_payload["Reference"] = reference
+                    payment_response = await xero_create_payments(token, tenant_id, [payment_payload])
+                    payment_rows = payment_response.get("Payments") or []
+                    first_payment = payment_rows[0] if payment_rows and isinstance(payment_rows[0], dict) else {}
+                    payment_result = {
+                        "attempted": True,
+                        "status": "paid",
+                        "provider_record_id": _as_text(first_payment.get("PaymentID")) or None,
+                        "raw": first_payment if first_payment else payment_response,
+                    }
+                except Exception as exc:
+                    payment_result = {"attempted": True, "status": "failed", "error": str(exc)}
             return {
                 "published": True,
                 "provider": provider,
                 "provider_record_id": provider_record_id,
                 "reference": _as_text(first.get("InvoiceNumber") or first.get("Reference")) or None,
                 "idempotency_key": body.idempotency_key,
+                "attachments": attachment_results,
+                "payment": payment_result,
                 "raw": first if first else response,
             }
 
@@ -1190,12 +1565,57 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             if not isinstance(bill, dict):
                 bill = {}
             provider_record_id = _as_text(bill.get("Id")) or None
+            attachment_results: list[dict[str, Any]] = []
+            if provider_record_id and attachments:
+                attachment_results = await _upload_quickbooks_attachments(token, realm_id, provider_record_id, attachments)
+            payment_result: dict[str, Any] | None = None
+            if provider_record_id and payment_request:
+                payment_result = {"attempted": True, "status": "failed"}
+                try:
+                    bank_account_ref = await _resolve_quickbooks_bank_account_ref(token, realm_id, payment_request)
+                    if not bank_account_ref:
+                        raise RuntimeError("Unable to resolve QuickBooks bank account for payment")
+                    amount = _to_float(payment_request.get("amount"))
+                    if amount is None:
+                        raise RuntimeError("Missing payment amount")
+                    payment_payload: dict[str, Any] = {
+                        "VendorRef": {"value": vendor_ref},
+                        "PayType": "Check",
+                        "CheckPayment": {"BankAccountRef": {"value": bank_account_ref}},
+                        "TotalAmt": amount,
+                        "Line": [
+                            {
+                                "Amount": amount,
+                                "LinkedTxn": [{"TxnId": provider_record_id, "TxnType": "Bill"}],
+                            }
+                        ],
+                    }
+                    payment_date = _normalize_date(payment_request.get("payment_date"))
+                    if payment_date:
+                        payment_payload["TxnDate"] = payment_date
+                    reference = _coalesce_text(payment_request, "reference")
+                    if reference:
+                        payment_payload["PrivateNote"] = reference
+                    payment_response = await quickbooks_create_bill_payment(token, realm_id, payment_payload)
+                    payment = payment_response.get("BillPayment") if isinstance(payment_response, dict) else {}
+                    if not isinstance(payment, dict):
+                        payment = {}
+                    payment_result = {
+                        "attempted": True,
+                        "status": "paid",
+                        "provider_record_id": _as_text(payment.get("Id")) or None,
+                        "raw": payment if payment else payment_response,
+                    }
+                except Exception as exc:
+                    payment_result = {"attempted": True, "status": "failed", "error": str(exc)}
             return {
                 "published": True,
                 "provider": provider,
                 "provider_record_id": provider_record_id,
                 "reference": _as_text(bill.get("DocNumber")) or None,
                 "idempotency_key": body.idempotency_key,
+                "attachments": attachment_results,
+                "payment": payment_result,
                 "raw": bill if bill else response,
             }
 
@@ -1212,8 +1632,32 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             default_tax_rate = _to_float(payload.get("tax"))
             if default_tax_rate is None and isinstance(category_row, dict):
                 default_tax_rate = _to_float(category_row.get("auto_sales_tax_rate"))
+            publish_payload = dict(payload)
+            attachment_results: list[dict[str, Any]] = []
+            if attachments:
+                first_attachment = attachments[0]
+                try:
+                    content, _content_type = await _download_attachment_entry(first_attachment)
+                    encoded_content = base64.b64encode(content).decode("ascii")
+                    publish_payload["attachments"] = [{**first_attachment, "content_base64": encoded_content}]
+                    attachment_results.append(
+                        {
+                            "document_id": _coalesce_text(first_attachment, "document_id") or None,
+                            "filename": _coalesce_text(first_attachment, "filename") or None,
+                            "status": "uploaded",
+                        }
+                    )
+                except Exception as exc:
+                    attachment_results.append(
+                        {
+                            "document_id": _coalesce_text(first_attachment, "document_id") or None,
+                            "filename": _coalesce_text(first_attachment, "filename") or None,
+                            "status": "failed",
+                            "error": str(exc),
+                        }
+                    )
             bill_payload = _build_free_agent_bill_payload(
-                payload,
+                publish_payload,
                 contact_url=contact_url,
                 category_url=category_url,
                 default_tax_rate=default_tax_rate,
@@ -1223,12 +1667,60 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             if not isinstance(bill, dict):
                 bill = {}
             provider_record_id = _as_text(bill.get("url") or bill.get("id")) or None
+            payment_result: dict[str, Any] | None = None
+            if provider_record_id and payment_request:
+                payment_result = {"attempted": True, "status": "failed"}
+                try:
+                    bank_account = await _resolve_free_agent_bank_account(token, subdomain, payment_request)
+                    if not isinstance(bank_account, dict):
+                        raise RuntimeError("Unable to resolve FreeAgent bank account for payment")
+                    amount = _to_float(payment_request.get("amount"))
+                    if amount is None:
+                        raise RuntimeError("Missing payment amount")
+                    payment_date = _normalize_date(payment_request.get("payment_date"))
+                    bank_txn_url = await _resolve_free_agent_bank_transaction_url(
+                        token,
+                        subdomain,
+                        bank_account=bank_account,
+                        payment_amount=amount,
+                        payment_date=payment_date,
+                    )
+                    if not bank_txn_url:
+                        raise RuntimeError("Unable to resolve FreeAgent bank transaction for payment")
+                    explanation_payload: dict[str, Any] = {
+                        "bank_transaction": bank_txn_url,
+                        "bill": provider_record_id,
+                        "gross_value": f"{amount:.2f}",
+                    }
+                    if payment_date:
+                        explanation_payload["dated_on"] = payment_date
+                    bank_account_url = _as_text(bank_account.get("url"))
+                    if bank_account_url:
+                        explanation_payload["bank_account"] = bank_account_url
+                    payment_response = await free_agent_create_bank_transaction_explanation(
+                        token,
+                        subdomain,
+                        explanation_payload,
+                    )
+                    explanation = payment_response.get("bank_transaction_explanation") if isinstance(payment_response, dict) else {}
+                    if not isinstance(explanation, dict):
+                        explanation = {}
+                    payment_result = {
+                        "attempted": True,
+                        "status": "paid",
+                        "provider_record_id": _as_text(explanation.get("url") or explanation.get("id")) or None,
+                        "raw": explanation if explanation else payment_response,
+                    }
+                except Exception as exc:
+                    payment_result = {"attempted": True, "status": "failed", "error": str(exc)}
             return {
                 "published": True,
                 "provider": provider,
                 "provider_record_id": provider_record_id,
                 "reference": _as_text(bill.get("reference")) or None,
                 "idempotency_key": body.idempotency_key,
+                "attachments": attachment_results,
+                "payment": payment_result,
                 "raw": bill if bill else response,
             }
 
