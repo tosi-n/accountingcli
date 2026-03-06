@@ -934,9 +934,6 @@ def _build_xero_invoice_payload(payload: dict[str, Any]) -> dict[str, Any]:
         account_code = _coalesce_text(item, "account_code") or _coalesce_text(payload, "account_code")
         if account_code:
             row["AccountCode"] = account_code
-        tax_code = _coalesce_text(item, "tax_code") or _coalesce_text(payload, "tax_code")
-        if tax_code:
-            row["TaxType"] = tax_code
         if row:
             line_items.append(row)
 
