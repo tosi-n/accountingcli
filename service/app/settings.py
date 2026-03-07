@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -11,7 +12,14 @@ class Settings(BaseSettings):
     ACCOUNTINGCLI_TOKEN_ENCRYPTION_KEY: str
 
     # DB
-    ACCOUNTINGCLI_DATABASE_URL: str = "sqlite+aiosqlite:////data/accountingcli.db"
+    # Precedence:
+    # 1. ACCOUNTINGCLI_DATABASE_URL (tool-specific override)
+    # 2. TOOL_DATABASE_URL (shared embedded-tool database)
+    # 3. DATABASE_URL (reuse host/backend database)
+    # 4. local SQLite fallback
+    ACCOUNTINGCLI_DATABASE_URL: str = ""
+    TOOL_DATABASE_URL: str = ""
+    DATABASE_URL: str = ""
 
     # Choreo
     CHOREO_SERVER_URL: str = "http://choreo:8080"
@@ -53,6 +61,26 @@ class Settings(BaseSettings):
     FREE_AGENT_TOKEN_URL: str = "https://api.sandbox.freeagent.com/v2/token_endpoint"
     FREE_AGENT_REVOKE_TOKEN_URL: str = ""
     FREE_AGENT_BASE_URL: str = "https://api.sandbox.freeagent.com"
+
+    @model_validator(mode="after")
+    def resolve_database_urls(self) -> "Settings":
+        explicit = (self.ACCOUNTINGCLI_DATABASE_URL or "").strip()
+        if explicit:
+            self.ACCOUNTINGCLI_DATABASE_URL = explicit
+            return self
+
+        shared_tool_db = (self.TOOL_DATABASE_URL or "").strip()
+        if shared_tool_db:
+            self.ACCOUNTINGCLI_DATABASE_URL = shared_tool_db
+            return self
+
+        host_db = (self.DATABASE_URL or "").strip()
+        if host_db:
+            self.ACCOUNTINGCLI_DATABASE_URL = host_db
+            return self
+
+        self.ACCOUNTINGCLI_DATABASE_URL = "sqlite+aiosqlite:////data/accountingcli.db"
+        return self
 
 
 settings = Settings()
