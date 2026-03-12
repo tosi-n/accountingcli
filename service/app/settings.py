@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     # Public origin used for OAuth redirect URI (Stimulir backend)
     BACKEND_PUBLIC_ORIGIN: str = "http://localhost:8000"
+    BACKEND_LEDGER_INGEST_PATH: str = "/api/v1/internal/ledger/provider-events"
 
     # Xero
     XERO_CLIENT_ID: str = ""
@@ -35,6 +36,7 @@ class Settings(BaseSettings):
     XERO_TOKEN_URL: str = "https://identity.xero.com/connect/token"
     XERO_REVOKE_TOKEN_URL: str = ""
     XERO_BASE_URL: str = "https://api.xero.com"
+    XERO_WEBHOOK_SIGNING_KEY: str = ""
 
     # QuickBooks
     QUICKBOOKS_CLIENT_ID: str = ""
@@ -44,6 +46,7 @@ class Settings(BaseSettings):
     QUICKBOOKS_TOKEN_URL: str = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
     QUICKBOOKS_BASE_URL: str = "https://sandbox-quickbooks.api.intuit.com"
     QUICKBOOKS_ENV: str = "sandbox"
+    QUICKBOOKS_WEBHOOK_VERIFIER_TOKEN: str = ""
 
     # Sage
     SAGE_CLIENT_ID: str = ""

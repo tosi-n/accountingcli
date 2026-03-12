@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import hashlib
+import hmac
+import json
 import os
 import re
 import time
@@ -17,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.choreo_runtime import choreo
 from app.crypto import TokenCipher
-from app.db import AccountingConnection, BankTransaction, Invoice, OAuthState, SyncRun, init_db, session_scope
+from app.db import AccountingConnection, BankTransaction, Invoice, OAuthState, SyncRun, WebhookReceipt, init_db, session_scope
 from app.internal_auth import require_internal_api_key
 from app.providers import (
     build_authorize_url,
@@ -114,6 +117,129 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _payload_sha256(payload_bytes: bytes) -> str:
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+
+def _headers_to_dict(request: Request) -> dict[str, str]:
+    return {str(key): str(value) for key, value in request.headers.items()}
+
+
+def _verify_xero_webhook_signature(payload_bytes: bytes, signature: str | None) -> bool:
+    secret = str(settings.XERO_WEBHOOK_SIGNING_KEY or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="XERO_WEBHOOK_SIGNING_KEY not configured")
+    if not signature:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), payload_bytes, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+def _verify_quickbooks_webhook_signature(payload_bytes: bytes, signature: str | None) -> bool:
+    secret = str(settings.QUICKBOOKS_WEBHOOK_VERIFIER_TOKEN or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="QUICKBOOKS_WEBHOOK_VERIFIER_TOKEN not configured")
+    if not signature:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), payload_bytes, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+def _normalize_payload_json(payload_bytes: bytes) -> dict[str, Any]:
+    if not payload_bytes:
+        return {}
+    try:
+        value = json.loads(payload_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object")
+    return value
+
+
+async def _find_connections_for_provider_account(
+    db: AsyncSession,
+    *,
+    provider: str,
+    provider_account_id: str,
+) -> list[AccountingConnection]:
+    if not provider_account_id:
+        return []
+    rows = (
+        await db.execute(
+            select(AccountingConnection).where(
+                AccountingConnection.provider == provider,
+            )
+        )
+    ).scalars().all()
+    matches: list[AccountingConnection] = []
+    for row in rows:
+        metadata = dict(row.metadata_ or {})
+        candidate_ids = {
+            str(row.tenant_id or "").strip(),
+            str(metadata.get("realm_id") or "").strip(),
+            str(metadata.get("tenant_id") or "").strip(),
+            str(metadata.get("tenantId") or "").strip(),
+        }
+        candidate_ids.discard("")
+        if provider_account_id in candidate_ids:
+            matches.append(row)
+    return matches
+
+
+async def _forward_ledger_event(payload: dict[str, Any]) -> None:
+    base = str(settings.BACKEND_PUBLIC_ORIGIN or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(status_code=500, detail="BACKEND_PUBLIC_ORIGIN not configured")
+    path = str(settings.BACKEND_LEDGER_INGEST_PATH or "").strip() or "/api/v1/internal/ledger/provider-events"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{base}{path}",
+            headers={"X-Internal-API-Key": settings.ACCOUNTINGCLI_INTERNAL_API_KEY},
+            json=payload,
+        )
+        response.raise_for_status()
+
+
+async def _upsert_webhook_receipt(
+    db: AsyncSession,
+    *,
+    provider: str,
+    provider_account_id: str | None,
+    idempotency_key: str,
+    signature_verified: bool,
+    request: Request,
+    payload_json: dict[str, Any],
+    payload_bytes: bytes,
+) -> tuple[WebhookReceipt, bool]:
+    existing = (
+        await db.execute(
+            select(WebhookReceipt).where(
+                WebhookReceipt.provider == provider,
+                WebhookReceipt.idempotency_key == idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    receipt = WebhookReceipt(
+        provider=provider,
+        provider_account_id=provider_account_id,
+        idempotency_key=idempotency_key,
+        signature_verified=signature_verified,
+        payload_sha256=_payload_sha256(payload_bytes),
+        headers=_headers_to_dict(request),
+        payload=payload_json,
+        status="received",
+    )
+    db.add(receipt)
+    await db.flush()
+    return receipt, True
 
 
 def _token_expires_at(token: dict[str, Any]) -> int:
@@ -962,7 +1088,7 @@ def _build_xero_invoice_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "LineItems": line_items or [{"Description": _coalesce_text(payload, "description", "summary") or vendor, "Quantity": 1}],
     }
     invoice_date = _normalize_date(_coalesce_text(payload, "invoice_date", "date"))
-    due_on = _normalize_date(_coalesce_text(payload, "due_on", "due_date"))
+    due_on = _normalize_date(_coalesce_text(payload, "due_on", "due_date")) or invoice_date
     invoice_number = _coalesce_text(payload, "invoice_number")
     reference = _coalesce_text(payload, "reference")
     currency = _coalesce_text(payload, "currency")
@@ -2111,3 +2237,209 @@ async def list_tax_codes(
             return _normalize_free_agent_tax_codes(rows)
 
         return []
+
+
+def _normalize_object_type(raw: str) -> str:
+    token = str(raw or "").strip().lower().replace(" ", "_")
+    token = token.replace("banktransaction", "bank_transaction")
+    token = token.replace("manualjournal", "manual_journal")
+    return token
+
+
+def _build_xero_forward_events(payload_json: dict[str, Any], signature_verified: bool, headers: dict[str, str]) -> list[dict[str, Any]]:
+    events = payload_json.get("events") or []
+    if not isinstance(events, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        tenant_id = str(event.get("tenantId") or "").strip()
+        resource_id = str(event.get("resourceId") or event.get("resourceUrl") or "").strip()
+        category = str(event.get("eventCategory") or "event").strip().lower()
+        operation = str(event.get("eventType") or "update").strip().lower()
+        event_time = event.get("eventDateUtc") or payload_json.get("lastEventSequence") or payload_json.get("firstEventSequence")
+        object_type = _normalize_object_type(category)
+        out.append(
+            {
+                "provider": "xero",
+                "provider_account_id": tenant_id,
+                "idempotency_key": f"xero:{tenant_id}:{object_type}:{resource_id or index}:{operation}:{event_time}",
+                "source": f"connector.xero.tenant/{tenant_id or 'unknown'}",
+                "type": f"xero.{object_type}.{operation}.v1",
+                "subject": resource_id or event.get("resourceUrl"),
+                "time": event.get("eventDateUtc"),
+                "headers": headers,
+                "data": event,
+                "signature_verified": signature_verified,
+                "object_type": object_type,
+                "external_id": resource_id or str(index),
+                "provider_updated_at": event.get("eventDateUtc"),
+                "auto_create_proposal": object_type in {"invoice", "bank_transaction", "manual_journal"},
+            }
+        )
+    return out
+
+
+def _build_quickbooks_forward_events(payload_json: dict[str, Any], signature_verified: bool, headers: dict[str, str]) -> list[dict[str, Any]]:
+    notifications = payload_json.get("eventNotifications") or []
+    if not isinstance(notifications, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for notification in notifications:
+        if not isinstance(notification, dict):
+            continue
+        realm_id = str(notification.get("realmId") or "").strip()
+        data_change = notification.get("dataChangeEvent") or {}
+        entities = data_change.get("entities") or []
+        if not isinstance(entities, list):
+            entities = []
+        for index, entity in enumerate(entities):
+            if not isinstance(entity, dict):
+                continue
+            object_type = _normalize_object_type(str(entity.get("name") or "entity"))
+            operation = str(entity.get("operation") or "update").strip().lower()
+            entity_id = str(entity.get("id") or "").strip()
+            updated_at = entity.get("lastUpdated")
+            out.append(
+                {
+                    "provider": "quickbooks",
+                    "provider_account_id": realm_id,
+                    "idempotency_key": f"qbo:{realm_id}:{object_type}:{entity_id or index}:{operation}:{updated_at}",
+                    "source": f"connector.quickbooks.realm/{realm_id or 'unknown'}",
+                    "type": f"qbo.{object_type}.{operation}.v1",
+                    "subject": entity_id or object_type,
+                    "time": updated_at,
+                    "headers": headers,
+                    "data": {**entity, "realmId": realm_id},
+                    "signature_verified": signature_verified,
+                    "object_type": object_type,
+                    "external_id": entity_id or str(index),
+                    "provider_updated_at": updated_at,
+                    "auto_create_proposal": object_type in {"invoice", "bill", "purchase", "journalentry"},
+                }
+            )
+    return out
+
+
+async def _forward_webhook_events(
+    db: AsyncSession,
+    *,
+    provider: str,
+    provider_events: list[dict[str, Any]],
+    receipt: WebhookReceipt,
+) -> int:
+    forwarded = 0
+    seen_profiles: set[tuple[str, str]] = set()
+    for event in provider_events:
+        provider_account_id = str(event.get("provider_account_id") or "").strip()
+        if not provider_account_id:
+            continue
+        matches = await _find_connections_for_provider_account(
+            db,
+            provider=provider,
+            provider_account_id=provider_account_id,
+        )
+        for conn in matches:
+            dedupe_key = (str(conn.business_profile_id), str(event["idempotency_key"]))
+            if dedupe_key in seen_profiles:
+                continue
+            seen_profiles.add(dedupe_key)
+            payload = dict(event)
+            payload["business_profile_id"] = str(conn.business_profile_id)
+            await _forward_ledger_event(payload)
+            forwarded += 1
+
+    receipt.status = "forwarded" if forwarded else "ignored"
+    receipt.forwarded_at = dt.datetime.now(dt.UTC)
+    await db.flush()
+    return forwarded
+
+
+@app.post("/webhooks/xero")
+async def xero_webhook(request: Request) -> dict[str, Any]:
+    payload_bytes = await request.body()
+    payload_json = _normalize_payload_json(payload_bytes)
+    signature = request.headers.get("x-xero-signature")
+    signature_verified = _verify_xero_webhook_signature(payload_bytes, signature)
+    if not signature_verified:
+        raise HTTPException(status_code=401, detail="Invalid Xero webhook signature")
+
+    provider_events = _build_xero_forward_events(payload_json, signature_verified, _headers_to_dict(request))
+    provider_account_id = str(((payload_json.get("events") or [{}])[0] or {}).get("tenantId") or "").strip()
+    idempotency_key = f"xero:{_payload_sha256(payload_bytes)}"
+
+    async for db in session_scope():
+        receipt, created = await _upsert_webhook_receipt(
+            db,
+            provider="xero",
+            provider_account_id=provider_account_id or None,
+            idempotency_key=idempotency_key,
+            signature_verified=signature_verified,
+            request=request,
+            payload_json=payload_json,
+            payload_bytes=payload_bytes,
+        )
+        if not created:
+            return {"status": "duplicate", "forwarded": 0}
+        try:
+            forwarded = await _forward_webhook_events(
+                db,
+                provider="xero",
+                provider_events=provider_events,
+                receipt=receipt,
+            )
+            await db.commit()
+            return {"status": "accepted", "forwarded": forwarded}
+        except Exception as exc:
+            receipt.status = "failed"
+            receipt.error = str(exc)
+            await db.commit()
+            raise HTTPException(status_code=502, detail=f"Failed forwarding Xero webhook: {exc}") from exc
+
+    return {"status": "accepted", "forwarded": 0}
+
+
+@app.post("/webhooks/quickbooks")
+async def quickbooks_webhook(request: Request) -> dict[str, Any]:
+    payload_bytes = await request.body()
+    payload_json = _normalize_payload_json(payload_bytes)
+    signature = request.headers.get("intuit-signature")
+    signature_verified = _verify_quickbooks_webhook_signature(payload_bytes, signature)
+    if not signature_verified:
+        raise HTTPException(status_code=401, detail="Invalid QuickBooks webhook signature")
+
+    provider_events = _build_quickbooks_forward_events(payload_json, signature_verified, _headers_to_dict(request))
+    notifications = payload_json.get("eventNotifications") or []
+    provider_account_id = str(((notifications[0] if notifications else {}) or {}).get("realmId") or "").strip()
+    idempotency_key = f"quickbooks:{_payload_sha256(payload_bytes)}"
+
+    async for db in session_scope():
+        receipt, created = await _upsert_webhook_receipt(
+            db,
+            provider="quickbooks",
+            provider_account_id=provider_account_id or None,
+            idempotency_key=idempotency_key,
+            signature_verified=signature_verified,
+            request=request,
+            payload_json=payload_json,
+            payload_bytes=payload_bytes,
+        )
+        if not created:
+            return {"status": "duplicate", "forwarded": 0}
+        try:
+            forwarded = await _forward_webhook_events(
+                db,
+                provider="quickbooks",
+                provider_events=provider_events,
+                receipt=receipt,
+            )
+            await db.commit()
+            return {"status": "accepted", "forwarded": forwarded}
+        except Exception as exc:
+            receipt.status = "failed"
+            receipt.error = str(exc)
+            await db.commit()
+            raise HTTPException(status_code=502, detail=f"Failed forwarding QuickBooks webhook: {exc}") from exc
+
+    return {"status": "accepted", "forwarded": 0}

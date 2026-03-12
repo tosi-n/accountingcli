@@ -114,6 +114,26 @@ class SyncRun(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), onupdate=lambda: dt.datetime.now(dt.UTC))
 
 
+class WebhookReceipt(Base):
+    __tablename__ = "webhook_receipts"
+    __table_args__ = (
+        UniqueConstraint("provider", "idempotency_key", name="uq_webhook_receipt_provider_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_account_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    signature_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    headers: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    forwarded_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC))
+
+
 _engine: Optional[AsyncEngine] = None
 _sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
 

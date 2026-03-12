@@ -78,37 +78,37 @@ class ChoreoClient:
 
         response = await self.client.post("/events", json=payload)
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def get_event(self, event_id: Union[str, UUID]) -> Event:
         """Get an event by ID"""
         response = await self.client.get(f"/events/{event_id}")
         response.raise_for_status()
-        return Event.from_dict(await response.json())
+        return Event.from_dict(response.json())
 
     async def get_run(self, run_id: Union[str, UUID]) -> FunctionRun:
         """Get a function run by ID"""
         response = await self.client.get(f"/runs/{run_id}")
         response.raise_for_status()
-        return FunctionRun.from_dict(await response.json())
+        return FunctionRun.from_dict(response.json())
 
     async def cancel_run(self, run_id: Union[str, UUID]) -> FunctionRun:
         """Cancel a function run"""
         response = await self.client.post(f"/runs/{run_id}/cancel")
         response.raise_for_status()
-        return FunctionRun.from_dict(await response.json())
+        return FunctionRun.from_dict(response.json())
 
     async def get_run_steps(self, run_id: Union[str, UUID]) -> List[Dict[str, Any]]:
         """Get steps for a function run"""
         response = await self.client.get(f"/runs/{run_id}/steps")
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def health_check(self) -> Dict[str, str]:
         """Check server health"""
         response = await self.client.get("/health")
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def lease_runs(
         self,
@@ -126,7 +126,7 @@ class ChoreoClient:
             },
         )
         response.raise_for_status()
-        return (await response.json()).get("runs", [])
+        return response.json().get("runs", [])
 
     async def complete_run(
         self,
@@ -139,7 +139,7 @@ class ChoreoClient:
             json={"output": output},
         )
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def fail_run(
         self,
@@ -153,7 +153,7 @@ class ChoreoClient:
             json={"error": error, "should_retry": should_retry},
         )
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def save_step(
         self,
@@ -167,7 +167,7 @@ class ChoreoClient:
             json={"output": output},
         )
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def worker_heartbeat(
         self,
@@ -183,7 +183,7 @@ class ChoreoClient:
             },
         )
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
     async def register_functions(
         self,
@@ -195,7 +195,7 @@ class ChoreoClient:
             json={"functions": functions},
         )
         response.raise_for_status()
-        return await response.json()
+        return response.json()
 
 
 class Choreo:
