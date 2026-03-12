@@ -89,6 +89,14 @@ class PublishIn(BaseModel):
     idempotency_key: str | None = None
 
 
+class PaymentIn(BaseModel):
+    business_profile_id: UUID
+    user_id: UUID
+    provider_record_id: str
+    payload: dict[str, Any]
+    idempotency_key: str | None = None
+
+
 class OAuthStatusOut(BaseModel):
     status: str
     tenant_id: str | None = None
@@ -1176,6 +1184,176 @@ async def _upload_quickbooks_attachments(
     return results
 
 
+async def _resolve_quickbooks_bill_vendor_ref(
+    token: dict[str, Any],
+    realm_id: str,
+    provider_record_id: str,
+) -> str | None:
+    page_size = 200
+    max_pages = 20
+    target_token = _normalize_token(provider_record_id)
+    if not target_token:
+        return None
+
+    for page in range(1, max_pages + 1):
+        start_position = ((page - 1) * page_size) + 1
+        response = await quickbooks_get_bills(
+            token,
+            realm_id,
+            start_position=start_position,
+            max_results=page_size,
+        )
+        rows = (response.get("QueryResponse") or {}).get("Bill") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if _normalize_token(row.get("Id")) != target_token:
+                continue
+            vendor_ref = row.get("VendorRef") or {}
+            resolved = _as_text(vendor_ref.get("value"))
+            if resolved:
+                return resolved
+        if len(rows) < page_size:
+            break
+    return None
+
+
+async def _apply_xero_payment(
+    token: dict[str, Any],
+    tenant_id: str,
+    *,
+    provider_record_id: str,
+    payment_request: dict[str, Any],
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    bank_account = await _resolve_xero_bank_account(token, tenant_id, payment_request)
+    if not isinstance(bank_account, dict):
+        raise RuntimeError("Unable to resolve Xero bank account for payment")
+    amount = _to_float(payment_request.get("amount"))
+    if amount is None:
+        raise RuntimeError("Missing payment amount")
+    payment_payload: dict[str, Any] = {
+        "Invoice": {"InvoiceID": provider_record_id},
+        "Account": {"AccountID": _as_text(bank_account.get("AccountID"))},
+        "Amount": amount,
+    }
+    payment_date = _normalize_date(payment_request.get("payment_date")) or _normalize_date(
+        (payload or {}).get("invoice_date")
+    )
+    if payment_date:
+        payment_payload["Date"] = payment_date
+    reference = _coalesce_text(payment_request, "reference")
+    if reference:
+        payment_payload["Reference"] = reference
+    payment_response = await xero_create_payments(token, tenant_id, [payment_payload])
+    payment_rows = payment_response.get("Payments") or []
+    first_payment = payment_rows[0] if payment_rows and isinstance(payment_rows[0], dict) else {}
+    return {
+        "attempted": True,
+        "status": "paid",
+        "provider_record_id": _as_text(first_payment.get("PaymentID")) or None,
+        "raw": first_payment if first_payment else payment_response,
+    }
+
+
+async def _apply_quickbooks_payment(
+    token: dict[str, Any],
+    realm_id: str,
+    *,
+    provider_record_id: str,
+    payment_request: dict[str, Any],
+    vendor_ref: str | None = None,
+) -> dict[str, Any]:
+    vendor_ref = vendor_ref or await _resolve_quickbooks_bill_vendor_ref(token, realm_id, provider_record_id)
+    if not vendor_ref:
+        raise RuntimeError("Unable to resolve QuickBooks vendor reference for payment")
+    bank_account_ref = await _resolve_quickbooks_bank_account_ref(token, realm_id, payment_request)
+    if not bank_account_ref:
+        raise RuntimeError("Unable to resolve QuickBooks bank account for payment")
+    amount = _to_float(payment_request.get("amount"))
+    if amount is None:
+        raise RuntimeError("Missing payment amount")
+    payment_payload: dict[str, Any] = {
+        "VendorRef": {"value": vendor_ref},
+        "PayType": "Check",
+        "CheckPayment": {"BankAccountRef": {"value": bank_account_ref}},
+        "TotalAmt": amount,
+        "Line": [
+            {
+                "Amount": amount,
+                "LinkedTxn": [{"TxnId": provider_record_id, "TxnType": "Bill"}],
+            }
+        ],
+    }
+    payment_date = _normalize_date(payment_request.get("payment_date"))
+    if payment_date:
+        payment_payload["TxnDate"] = payment_date
+    reference = _coalesce_text(payment_request, "reference")
+    if reference:
+        payment_payload["PrivateNote"] = reference
+    payment_response = await quickbooks_create_bill_payment(token, realm_id, payment_payload)
+    payment = payment_response.get("BillPayment") if isinstance(payment_response, dict) else {}
+    if not isinstance(payment, dict):
+        payment = {}
+    return {
+        "attempted": True,
+        "status": "paid",
+        "provider_record_id": _as_text(payment.get("Id")) or None,
+        "raw": payment if payment else payment_response,
+    }
+
+
+async def _apply_free_agent_payment(
+    token: dict[str, Any],
+    subdomain: str,
+    *,
+    provider_record_id: str,
+    payment_request: dict[str, Any],
+) -> dict[str, Any]:
+    bank_account = await _resolve_free_agent_bank_account(token, subdomain, payment_request)
+    if not isinstance(bank_account, dict):
+        raise RuntimeError("Unable to resolve FreeAgent bank account for payment")
+    amount = _to_float(payment_request.get("amount"))
+    if amount is None:
+        raise RuntimeError("Missing payment amount")
+    payment_date = _normalize_date(payment_request.get("payment_date"))
+    bank_txn_url = await _resolve_free_agent_bank_transaction_url(
+        token,
+        subdomain,
+        bank_account=bank_account,
+        payment_amount=amount,
+        payment_date=payment_date,
+    )
+    if not bank_txn_url:
+        raise RuntimeError("Unable to resolve FreeAgent bank transaction for payment")
+    explanation_payload: dict[str, Any] = {
+        "bank_transaction": bank_txn_url,
+        "bill": provider_record_id,
+        "gross_value": f"{amount:.2f}",
+    }
+    if payment_date:
+        explanation_payload["dated_on"] = payment_date
+    bank_account_url = _as_text(bank_account.get("url"))
+    if bank_account_url:
+        explanation_payload["bank_account"] = bank_account_url
+    payment_response = await free_agent_create_bank_transaction_explanation(
+        token,
+        subdomain,
+        explanation_payload,
+    )
+    explanation = payment_response.get("bank_transaction_explanation") if isinstance(payment_response, dict) else {}
+    if not isinstance(explanation, dict):
+        explanation = {}
+    return {
+        "attempted": True,
+        "status": "paid",
+        "provider_record_id": _as_text(explanation.get("url") or explanation.get("id")) or None,
+        "raw": explanation if explanation else payment_response,
+    }
+
+
 async def _create_oauth_state(
     db: AsyncSession,
     provider: str,
@@ -1501,32 +1679,13 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             if provider_record_id and payment_request:
                 payment_result = {"attempted": True, "status": "failed"}
                 try:
-                    bank_account = await _resolve_xero_bank_account(token, tenant_id, payment_request)
-                    if not isinstance(bank_account, dict):
-                        raise RuntimeError("Unable to resolve Xero bank account for payment")
-                    amount = _to_float(payment_request.get("amount"))
-                    if amount is None:
-                        raise RuntimeError("Missing payment amount")
-                    payment_payload: dict[str, Any] = {
-                        "Invoice": {"InvoiceID": provider_record_id},
-                        "Account": {"AccountID": _as_text(bank_account.get("AccountID"))},
-                        "Amount": amount,
-                    }
-                    payment_date = _normalize_date(payment_request.get("payment_date")) or _normalize_date(first.get("Date")) or _normalize_date(payload.get("invoice_date"))
-                    if payment_date:
-                        payment_payload["Date"] = payment_date
-                    reference = _coalesce_text(payment_request, "reference")
-                    if reference:
-                        payment_payload["Reference"] = reference
-                    payment_response = await xero_create_payments(token, tenant_id, [payment_payload])
-                    payment_rows = payment_response.get("Payments") or []
-                    first_payment = payment_rows[0] if payment_rows and isinstance(payment_rows[0], dict) else {}
-                    payment_result = {
-                        "attempted": True,
-                        "status": "paid",
-                        "provider_record_id": _as_text(first_payment.get("PaymentID")) or None,
-                        "raw": first_payment if first_payment else payment_response,
-                    }
+                    payment_result = await _apply_xero_payment(
+                        token,
+                        tenant_id,
+                        provider_record_id=provider_record_id,
+                        payment_request=payment_request,
+                        payload=payload,
+                    )
                 except Exception as exc:
                     payment_result = {"attempted": True, "status": "failed", "error": str(exc)}
             return {
@@ -1569,40 +1728,13 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             if provider_record_id and payment_request:
                 payment_result = {"attempted": True, "status": "failed"}
                 try:
-                    bank_account_ref = await _resolve_quickbooks_bank_account_ref(token, realm_id, payment_request)
-                    if not bank_account_ref:
-                        raise RuntimeError("Unable to resolve QuickBooks bank account for payment")
-                    amount = _to_float(payment_request.get("amount"))
-                    if amount is None:
-                        raise RuntimeError("Missing payment amount")
-                    payment_payload: dict[str, Any] = {
-                        "VendorRef": {"value": vendor_ref},
-                        "PayType": "Check",
-                        "CheckPayment": {"BankAccountRef": {"value": bank_account_ref}},
-                        "TotalAmt": amount,
-                        "Line": [
-                            {
-                                "Amount": amount,
-                                "LinkedTxn": [{"TxnId": provider_record_id, "TxnType": "Bill"}],
-                            }
-                        ],
-                    }
-                    payment_date = _normalize_date(payment_request.get("payment_date"))
-                    if payment_date:
-                        payment_payload["TxnDate"] = payment_date
-                    reference = _coalesce_text(payment_request, "reference")
-                    if reference:
-                        payment_payload["PrivateNote"] = reference
-                    payment_response = await quickbooks_create_bill_payment(token, realm_id, payment_payload)
-                    payment = payment_response.get("BillPayment") if isinstance(payment_response, dict) else {}
-                    if not isinstance(payment, dict):
-                        payment = {}
-                    payment_result = {
-                        "attempted": True,
-                        "status": "paid",
-                        "provider_record_id": _as_text(payment.get("Id")) or None,
-                        "raw": payment if payment else payment_response,
-                    }
+                    payment_result = await _apply_quickbooks_payment(
+                        token,
+                        realm_id,
+                        provider_record_id=provider_record_id,
+                        payment_request=payment_request,
+                        vendor_ref=vendor_ref,
+                    )
                 except Exception as exc:
                     payment_result = {"attempted": True, "status": "failed", "error": str(exc)}
             return {
@@ -1668,46 +1800,12 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             if provider_record_id and payment_request:
                 payment_result = {"attempted": True, "status": "failed"}
                 try:
-                    bank_account = await _resolve_free_agent_bank_account(token, subdomain, payment_request)
-                    if not isinstance(bank_account, dict):
-                        raise RuntimeError("Unable to resolve FreeAgent bank account for payment")
-                    amount = _to_float(payment_request.get("amount"))
-                    if amount is None:
-                        raise RuntimeError("Missing payment amount")
-                    payment_date = _normalize_date(payment_request.get("payment_date"))
-                    bank_txn_url = await _resolve_free_agent_bank_transaction_url(
+                    payment_result = await _apply_free_agent_payment(
                         token,
                         subdomain,
-                        bank_account=bank_account,
-                        payment_amount=amount,
-                        payment_date=payment_date,
+                        provider_record_id=provider_record_id,
+                        payment_request=payment_request,
                     )
-                    if not bank_txn_url:
-                        raise RuntimeError("Unable to resolve FreeAgent bank transaction for payment")
-                    explanation_payload: dict[str, Any] = {
-                        "bank_transaction": bank_txn_url,
-                        "bill": provider_record_id,
-                        "gross_value": f"{amount:.2f}",
-                    }
-                    if payment_date:
-                        explanation_payload["dated_on"] = payment_date
-                    bank_account_url = _as_text(bank_account.get("url"))
-                    if bank_account_url:
-                        explanation_payload["bank_account"] = bank_account_url
-                    payment_response = await free_agent_create_bank_transaction_explanation(
-                        token,
-                        subdomain,
-                        explanation_payload,
-                    )
-                    explanation = payment_response.get("bank_transaction_explanation") if isinstance(payment_response, dict) else {}
-                    if not isinstance(explanation, dict):
-                        explanation = {}
-                    payment_result = {
-                        "attempted": True,
-                        "status": "paid",
-                        "provider_record_id": _as_text(explanation.get("url") or explanation.get("id")) or None,
-                        "raw": explanation if explanation else payment_response,
-                    }
                 except Exception as exc:
                     payment_result = {"attempted": True, "status": "failed", "error": str(exc)}
             return {
@@ -1722,6 +1820,73 @@ async def publish_bill(provider: str, body: PublishIn) -> dict[str, Any]:
             }
 
         raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+
+
+@app.post("/internal/pay/{provider}", dependencies=[Depends(require_internal_api_key)])
+async def apply_payment(provider: str, body: PaymentIn) -> dict[str, Any]:
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    if provider == "sage":
+        raise HTTPException(status_code=400, detail="Sage payment is unsupported in this release")
+
+    payment_request = dict(body.payload or {})
+    if not payment_request:
+        raise HTTPException(status_code=400, detail="Missing payment payload")
+
+    async for db in session_scope():
+        conn = await _get_connection(db, body.business_profile_id, provider, body.user_id)
+        if not conn:
+            raise HTTPException(status_code=404, detail=f"No {provider} connection for this user/profile")
+
+        try:
+            token = await _maybe_refresh_connection_token(db, conn)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to refresh {provider} token: {exc}") from exc
+
+        try:
+            if provider == "xero":
+                tenant_id = await _resolve_xero_tenant_id(db, conn, token)
+                if not tenant_id:
+                    raise HTTPException(status_code=422, detail="Missing Xero tenant_id")
+                payment_result = await _apply_xero_payment(
+                    token,
+                    tenant_id,
+                    provider_record_id=body.provider_record_id,
+                    payment_request=payment_request,
+                )
+            elif provider == "quickbooks":
+                realm_id = _resolve_quickbooks_realm_id(conn, token)
+                if not realm_id:
+                    raise HTTPException(status_code=422, detail="Missing QuickBooks realm_id")
+                payment_result = await _apply_quickbooks_payment(
+                    token,
+                    realm_id,
+                    provider_record_id=body.provider_record_id,
+                    payment_request=payment_request,
+                )
+            elif provider == "free_agent":
+                subdomain = await _resolve_free_agent_subdomain(db, conn, token)
+                if not subdomain:
+                    raise HTTPException(status_code=422, detail="Missing FreeAgent subdomain")
+                payment_result = await _apply_free_agent_payment(
+                    token,
+                    subdomain,
+                    provider_record_id=body.provider_record_id,
+                    payment_request=payment_request,
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return {
+            "provider": provider,
+            "provider_record_id": body.provider_record_id,
+            "idempotency_key": body.idempotency_key,
+            **payment_result,
+        }
 
 
 @app.get("/internal/data/bank-transactions", dependencies=[Depends(require_internal_api_key)])
