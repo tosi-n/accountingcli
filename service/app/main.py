@@ -104,6 +104,13 @@ class OAuthStatusOut(BaseModel):
     status: str
     tenant_id: str | None = None
     tenant_name: str | None = None
+    owner_user_id: str | None = None
+    scopes: list[str] | None = None
+    access_token_expires_at: int | None = None
+    refresh_token_expires_at: int | None = None
+    last_refresh_attempt_at: str | None = None
+    last_refresh_succeeded_at: str | None = None
+    last_error: str | None = None
 
 
 def _cipher() -> TokenCipher:
@@ -251,6 +258,80 @@ def _token_expires_at(token: dict[str, Any]) -> int:
     return 0
 
 
+def _token_scope_list(token: dict[str, Any]) -> list[str]:
+    raw_scope = token.get("scope")
+    if isinstance(raw_scope, str):
+        return [part for part in raw_scope.replace(",", " ").split() if part]
+    if isinstance(raw_scope, list):
+        return [str(part).strip() for part in raw_scope if str(part).strip()]
+    return []
+
+
+def _refresh_token_expires_at(token: dict[str, Any]) -> int | None:
+    absolute = token.get("refresh_token_expires_at")
+    if isinstance(absolute, (int, float)):
+        return int(absolute)
+    if isinstance(absolute, str) and absolute.isdigit():
+        return int(absolute)
+    relative = token.get("refresh_token_expires_in")
+    if isinstance(relative, str) and relative.isdigit():
+        relative = int(relative)
+    if isinstance(relative, (int, float)) and int(relative) > 0:
+        return int(time.time()) + int(relative)
+    return None
+
+
+def _connection_health_patch(
+    token: dict[str, Any],
+    *,
+    last_refresh_attempt_at: str | None = None,
+    last_refresh_succeeded_at: str | None = None,
+    last_error: str | None = None,
+    last_provider_http_status: int | None = None,
+    oauth_status: str | None = None,
+) -> dict[str, Any]:
+    patch: dict[str, Any] = {
+        "scopes": _token_scope_list(token),
+        "access_token_expires_at": _token_expires_at(token) or None,
+        "refresh_token_expires_at": _refresh_token_expires_at(token),
+    }
+    if last_refresh_attempt_at is not None:
+        patch["last_refresh_attempt_at"] = last_refresh_attempt_at
+    if last_refresh_succeeded_at is not None:
+        patch["last_refresh_succeeded_at"] = last_refresh_succeeded_at
+    if last_error is not None:
+        patch["last_refresh_error"] = last_error
+        patch["last_error"] = last_error
+    if last_provider_http_status is not None:
+        patch["last_provider_http_status"] = int(last_provider_http_status)
+    if oauth_status is not None:
+        patch["oauth_status"] = oauth_status
+    return patch
+
+
+def _is_reauth_required(metadata: dict[str, Any] | None) -> bool:
+    meta = dict(metadata or {})
+    oauth_status = str(meta.get("oauth_status") or "").strip().lower()
+    if oauth_status in {"reauth_required", "needs_reauth", "expired", "unauthorized"}:
+        return True
+    error_text = str(meta.get("last_refresh_error") or meta.get("last_error") or "").strip().lower()
+    if not error_text:
+        return False
+    return any(
+        marker in error_text
+        for marker in (
+            "invalid_grant",
+            "invalid_client",
+            "unauthorized",
+            "forbidden",
+            "reauth",
+            "refresh token",
+            "failed to refresh",
+            "connect/token",
+        )
+    )
+
+
 async def _maybe_refresh_connection_token(db: AsyncSession, conn: AccountingConnection) -> dict[str, Any]:
     token = _cipher().decrypt_json(conn.token_encrypted)
     if _token_expires_at(token) > int(time.time()) + 60:
@@ -258,8 +339,40 @@ async def _maybe_refresh_connection_token(db: AsyncSession, conn: AccountingConn
     refresh_token = token.get("refresh_token")
     if not refresh_token:
         return token
-    refreshed = await provider_refresh_token(conn.provider, str(refresh_token))
+    attempted_at = dt.datetime.now(dt.UTC).isoformat()
+    try:
+        refreshed = await provider_refresh_token(conn.provider, str(refresh_token))
+    except Exception as exc:
+        status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None else None
+        metadata = dict(conn.metadata_ or {})
+        metadata.update(
+            _connection_health_patch(
+                token,
+                last_refresh_attempt_at=attempted_at,
+                last_error=str(exc),
+                last_provider_http_status=status_code,
+                oauth_status="reauth_required",
+            )
+        )
+        conn.metadata_ = metadata
+        conn.updated_at = dt.datetime.now(dt.UTC)
+        await db.commit()
+        await db.refresh(conn)
+        raise
+
     conn.token_encrypted = _cipher().encrypt_json(refreshed)
+    metadata = dict(conn.metadata_ or {})
+    metadata.update(
+        _connection_health_patch(
+            refreshed,
+            last_refresh_attempt_at=attempted_at,
+            last_refresh_succeeded_at=dt.datetime.now(dt.UTC).isoformat(),
+            last_error="",
+            last_provider_http_status=200,
+            oauth_status="connected",
+        )
+    )
+    conn.metadata_ = metadata
     conn.updated_at = dt.datetime.now(dt.UTC)
     await db.commit()
     await db.refresh(conn)
@@ -1545,6 +1658,7 @@ async def _upsert_connection(
     existing = res.scalars().first()
     if existing:
         meta = dict(existing.metadata_ or {})
+        meta.update(_connection_health_patch(token, oauth_status="connected"))
         if metadata_patch:
             meta.update(metadata_patch)
         await db.execute(
@@ -1570,7 +1684,7 @@ async def _upsert_connection(
         token_encrypted=enc,
         tenant_id=tenant_id,
         tenant_name=tenant_name,
-        metadata_=metadata_patch or {},
+        metadata_=({} | _connection_health_patch(token, oauth_status="connected") | (metadata_patch or {})),
         created_at=now,
         updated_at=now,
     )
@@ -1690,7 +1804,23 @@ async def status(provider: str, business_profile_id: UUID, user_id: UUID) -> OAu
         conn = await _get_connection(db, business_profile_id, provider, user_id)
         if not conn:
             return OAuthStatusOut(status="not_connected")
-        return OAuthStatusOut(status="connected", tenant_id=conn.tenant_id, tenant_name=conn.tenant_name)
+        metadata = dict(conn.metadata_ or {})
+        status_value = "reauth_required" if _is_reauth_required(metadata) else "connected"
+        scopes = metadata.get("scopes")
+        if not isinstance(scopes, list):
+            scopes = None
+        return OAuthStatusOut(
+            status=status_value,
+            tenant_id=conn.tenant_id,
+            tenant_name=conn.tenant_name,
+            owner_user_id=str(conn.user_id),
+            scopes=scopes,
+            access_token_expires_at=metadata.get("access_token_expires_at"),
+            refresh_token_expires_at=metadata.get("refresh_token_expires_at"),
+            last_refresh_attempt_at=metadata.get("last_refresh_attempt_at"),
+            last_refresh_succeeded_at=metadata.get("last_refresh_succeeded_at"),
+            last_error=(str(metadata.get("last_error") or "").strip() or None),
+        )
 
 
 @app.post("/internal/oauth/{provider}/disconnect", dependencies=[Depends(require_internal_api_key)])
