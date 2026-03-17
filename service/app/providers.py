@@ -237,6 +237,25 @@ async def xero_get_invoices(
         return resp.json()
 
 
+async def xero_get_invoice_by_id(
+    token: dict[str, Any],
+    tenant_id: str,
+    invoice_id: str,
+) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Accept": "application/json",
+        "xero-tenant-id": tenant_id,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(
+            urllib.parse.urljoin(settings.XERO_BASE_URL, f"/api.xro/2.0/Invoices/{invoice_id}"),
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def xero_get_accounts(token: dict[str, Any], tenant_id: str) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {token['access_token']}",
