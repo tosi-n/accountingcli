@@ -43,6 +43,7 @@ from app.providers import (
     xero_create_invoices,
     xero_get_accounts,
     xero_get_connections,
+    xero_get_payment,
     xero_get_tax_rates,
     xero_upload_invoice_attachment,
 )
@@ -2143,6 +2144,61 @@ async def apply_payment(provider: str, body: PaymentIn) -> dict[str, Any]:
             "idempotency_key": body.idempotency_key,
             **payment_result,
         }
+
+
+@app.get("/internal/data/payments/{payment_id}", dependencies=[Depends(require_internal_api_key)])
+async def get_payment(
+    payment_id: str,
+    business_profile_id: UUID,
+    provider: str,
+    user_id: UUID,
+) -> dict[str, Any]:
+    """Fetch a single payment from the LIVE provider API (not local cache)."""
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    if provider != "xero":
+        raise HTTPException(status_code=400, detail=f"get_payment not yet supported for {provider}")
+
+    async for db in session_scope():
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
+        if not conn:
+            raise HTTPException(status_code=404, detail=f"No {provider} connection for this user/profile")
+
+        try:
+            token = await _maybe_refresh_connection_token(db, conn)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to refresh {provider} token: {exc}") from exc
+
+        tenant_id = await _resolve_xero_tenant_id(db, conn, token)
+        if not tenant_id:
+            raise HTTPException(status_code=422, detail="Missing Xero tenant_id")
+
+        try:
+            payload = await xero_get_payment(token, tenant_id, payment_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Payment {payment_id} not found in Xero") from exc
+            raise HTTPException(status_code=502, detail=f"Xero API error: {exc}") from exc
+
+        payments = payload.get("Payments") or []
+        if not payments:
+            raise HTTPException(status_code=404, detail=f"Payment {payment_id} not found in Xero response")
+
+        payment = payments[0]
+        return {
+            "provider": provider,
+            "payment_id": payment.get("PaymentID"),
+            "status": payment.get("Status"),
+            "is_reconciled": payment.get("IsReconciled", False),
+            "amount": payment.get("Amount"),
+            "date": payment.get("Date"),
+            "reference": payment.get("Reference"),
+            "invoice_id": (payment.get("Invoice") or {}).get("InvoiceID"),
+            "account_id": (payment.get("Account") or {}).get("AccountID"),
+            "raw": payment,
+        }
+
+    raise HTTPException(status_code=500, detail="No database session")
 
 
 @app.get("/internal/data/bank-transactions", dependencies=[Depends(require_internal_api_key)])
