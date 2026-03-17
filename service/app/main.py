@@ -43,6 +43,7 @@ from app.providers import (
     xero_create_invoices,
     xero_get_accounts,
     xero_get_connections,
+    xero_get_bank_transaction,
     xero_get_invoice_by_id,
     xero_get_payment,
     xero_get_tax_rates,
@@ -2251,6 +2252,60 @@ async def get_invoice_live(
             "amount_paid": invoice.get("AmountPaid"),
             "payments": payments,
             "raw": invoice,
+        }
+
+    raise HTTPException(status_code=500, detail="No database session")
+
+
+@app.get("/internal/data/bank-transaction/{bank_transaction_id}", dependencies=[Depends(require_internal_api_key)])
+async def get_bank_transaction_live(
+    bank_transaction_id: str,
+    business_profile_id: UUID,
+    provider: str,
+    user_id: UUID,
+) -> dict[str, Any]:
+    """Fetch a single bank transaction from the LIVE Xero API and return its IsReconciled status."""
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    if provider != "xero":
+        raise HTTPException(status_code=400, detail=f"get_bank_transaction not yet supported for {provider}")
+
+    async for db in session_scope():
+        conn = await _get_connection(db, business_profile_id, provider, user_id)
+        if not conn:
+            raise HTTPException(status_code=404, detail=f"No {provider} connection for this user/profile")
+
+        try:
+            token = await _maybe_refresh_connection_token(db, conn)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to refresh {provider} token: {exc}") from exc
+
+        tenant_id = await _resolve_xero_tenant_id(db, conn, token)
+        if not tenant_id:
+            raise HTTPException(status_code=422, detail="Missing Xero tenant_id")
+
+        try:
+            payload = await xero_get_bank_transaction(token, tenant_id, bank_transaction_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"BankTransaction {bank_transaction_id} not found in Xero") from exc
+            raise HTTPException(status_code=502, detail=f"Xero API error: {exc}") from exc
+
+        bank_txns = payload.get("BankTransactions") or []
+        if not bank_txns:
+            raise HTTPException(status_code=404, detail=f"BankTransaction {bank_transaction_id} not found in Xero response")
+
+        bt = bank_txns[0]
+        return {
+            "provider": provider,
+            "bank_transaction_id": bt.get("BankTransactionID"),
+            "status": bt.get("Status"),
+            "is_reconciled": bt.get("IsReconciled", False),
+            "amount": bt.get("Total"),
+            "date": bt.get("Date"),
+            "reference": bt.get("Reference"),
+            "contact_name": (bt.get("Contact") or {}).get("Name"),
+            "raw": bt,
         }
 
     raise HTTPException(status_code=500, detail="No database session")
