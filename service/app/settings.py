@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     FREE_AGENT_REVOKE_TOKEN_URL: str = ""
     FREE_AGENT_BASE_URL: str = "https://api.sandbox.freeagent.com"
 
+    # Proactive token refresh
+    ACCOUNTINGCLI_TOKEN_REFRESH_INTERVAL_HOURS: int = 12
+    ACCOUNTINGCLI_ACCESS_TOKEN_REFRESH_BUFFER_HOURS: int = 1
+    ACCOUNTINGCLI_REFRESH_TOKEN_STALENESS_DAYS: int = 30
+
     @model_validator(mode="after")
     def resolve_database_urls(self) -> "Settings":
         explicit = (self.ACCOUNTINGCLI_DATABASE_URL or "").strip()

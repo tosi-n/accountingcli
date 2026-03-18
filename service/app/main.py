@@ -5,6 +5,8 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import asyncio
+import logging
 import os
 import re
 import time
@@ -52,19 +54,161 @@ from app.providers import (
 from app.settings import settings
 
 
+logger = logging.getLogger("accountingcli")
+
 app = FastAPI(title="accountingcli", version="0.1.0")
 SUPPORTED_PROVIDERS = {"xero", "quickbooks", "sage", "free_agent"}
+
+# How often the background loop checks all connections (default: 12 hours).
+_TOKEN_REFRESH_INTERVAL_S = int(
+    getattr(settings, "ACCOUNTINGCLI_TOKEN_REFRESH_INTERVAL_HOURS", 0) or 12
+) * 3600
+# Proactively refresh access tokens expiring within this window (default: 1 hour).
+_ACCESS_TOKEN_REFRESH_BUFFER_S = int(
+    getattr(settings, "ACCOUNTINGCLI_ACCESS_TOKEN_REFRESH_BUFFER_HOURS", 0) or 1
+) * 3600
+# Proactively refresh if the refresh token hasn't been rotated in this many days (default: 30).
+_REFRESH_TOKEN_STALENESS_DAYS = int(
+    getattr(settings, "ACCOUNTINGCLI_REFRESH_TOKEN_STALENESS_DAYS", 0) or 30
+)
+
+_refresh_task: asyncio.Task | None = None
+
+
+async def _proactive_token_refresh_loop() -> None:
+    """Background loop that keeps OAuth tokens warm so they never silently expire."""
+    await asyncio.sleep(30)  # let the app finish starting
+    while True:
+        try:
+            await _refresh_all_connections()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Proactive token refresh sweep failed")
+        await asyncio.sleep(_TOKEN_REFRESH_INTERVAL_S)
+
+
+async def _refresh_all_connections() -> None:
+    now = int(time.time())
+    staleness_cutoff = now - (_REFRESH_TOKEN_STALENESS_DAYS * 86400)
+
+    async for db in session_scope():
+        result = await db.execute(select(AccountingConnection))
+        connections = result.scalars().all()
+
+        for conn in connections:
+            try:
+                token = _cipher().decrypt_json(conn.token_encrypted)
+            except Exception:
+                logger.warning("Cannot decrypt token for connection %s — skipping", conn.id)
+                continue
+
+            access_expires = _token_expires_at(token)
+            needs_refresh = False
+            reason = ""
+
+            # 1) Access token expiring soon
+            if access_expires and access_expires < now + _ACCESS_TOKEN_REFRESH_BUFFER_S:
+                needs_refresh = True
+                reason = f"access_token expires in {access_expires - now}s"
+
+            # 2) Refresh token getting stale (not rotated recently)
+            if not needs_refresh:
+                meta = conn.metadata_ if isinstance(conn.metadata_, dict) else {}
+                last_refreshed = meta.get("last_refresh_succeeded_at")
+                if last_refreshed:
+                    try:
+                        last_ts = int(dt.datetime.fromisoformat(last_refreshed).timestamp())
+                    except (ValueError, TypeError):
+                        last_ts = 0
+                else:
+                    last_ts = 0
+                if last_ts and last_ts < staleness_cutoff:
+                    needs_refresh = True
+                    reason = f"refresh_token stale ({(now - last_ts) // 86400}d since last rotation)"
+                elif not last_ts:
+                    # Never refreshed — refresh now to establish baseline
+                    needs_refresh = True
+                    reason = "no prior refresh recorded"
+
+            if not needs_refresh:
+                continue
+
+            refresh_value = token.get("refresh_token")
+            if not refresh_value:
+                logger.warning("Connection %s (%s) needs refresh but has no refresh_token", conn.id, conn.provider)
+                continue
+
+            logger.info("Proactive refresh for connection %s (%s): %s", conn.id, conn.provider, reason)
+            attempted_at = dt.datetime.now(dt.UTC).isoformat()
+            try:
+                refreshed = await provider_refresh_token(conn.provider, str(refresh_value))
+            except Exception as exc:
+                status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None else None
+                meta = dict(conn.metadata_ or {})
+                meta.update(
+                    _connection_health_patch(
+                        token,
+                        last_refresh_attempt_at=attempted_at,
+                        last_error=f"proactive_refresh_failed: {exc}",
+                        last_provider_http_status=status_code,
+                        oauth_status="reauth_required" if status_code in (400, 401) else "refresh_error",
+                    )
+                )
+                conn.metadata_ = meta
+                conn.updated_at = dt.datetime.now(dt.UTC)
+                await db.commit()
+                await db.refresh(conn)
+                logger.error("Proactive refresh failed for %s (%s): %s", conn.id, conn.provider, exc)
+                continue
+
+            conn.token_encrypted = _cipher().encrypt_json(refreshed)
+            meta = dict(conn.metadata_ or {})
+            meta.update(
+                _connection_health_patch(
+                    refreshed,
+                    last_refresh_attempt_at=attempted_at,
+                    last_refresh_succeeded_at=dt.datetime.now(dt.UTC).isoformat(),
+                    last_error="",
+                    last_provider_http_status=200,
+                    oauth_status="connected",
+                )
+            )
+            conn.metadata_ = meta
+            conn.updated_at = dt.datetime.now(dt.UTC)
+            await db.commit()
+            await db.refresh(conn)
+            logger.info("Proactive refresh succeeded for %s (%s)", conn.id, conn.provider)
 
 
 @app.on_event("startup")
 async def _startup() -> None:
+    global _refresh_task
     os.makedirs("/data", exist_ok=True)
     await init_db()
+    _refresh_task = asyncio.create_task(_proactive_token_refresh_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if _refresh_task and not _refresh_task.done():
+        _refresh_task.cancel()
+        try:
+            await _refresh_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/internal/refresh-tokens", dependencies=[Depends(require_internal_api_key)])
+async def refresh_tokens_now() -> dict[str, Any]:
+    """Force an immediate proactive refresh sweep across all connections."""
+    await _refresh_all_connections()
+    return {"status": "ok", "message": "Proactive refresh sweep completed"}
 
 
 class AuthorizeUrlIn(BaseModel):
