@@ -48,7 +48,7 @@ def _to_float(value: Any) -> float | None:
 
 
 async def _maybe_refresh(provider: str, token: dict[str, Any]) -> dict[str, Any]:
-    if _token_expires_at(token) > int(time.time()) + 60:
+    if _token_expires_at(token) > int(time.time()) + 300:
         return token
     rt = token.get("refresh_token")
     if not rt:

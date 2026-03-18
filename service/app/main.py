@@ -481,7 +481,9 @@ def _is_reauth_required(metadata: dict[str, Any] | None) -> bool:
 
 async def _maybe_refresh_connection_token(db: AsyncSession, conn: AccountingConnection) -> dict[str, Any]:
     token = _cipher().decrypt_json(conn.token_encrypted)
-    if _token_expires_at(token) > int(time.time()) + 60:
+    # Xero access tokens last 30min. Refresh 5 min early to avoid race conditions
+    # on slow API calls. Each refresh also rotates the refresh token (60-day lifespan).
+    if _token_expires_at(token) > int(time.time()) + 300:
         return token
     refresh_token = token.get("refresh_token")
     if not refresh_token:
